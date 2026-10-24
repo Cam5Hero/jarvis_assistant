@@ -19,8 +19,11 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -203,6 +206,99 @@ def save_env_values(updates: dict[str, str], env_path: Path | None = None,
     return J.write_env(quoted, env_path, example_path)
 
 
+_env_backed_up: set[str] = set()  # .env files already copied to .env.bak this session
+
+
+def save_env_value(key: str, value: str, env_path: Path | None = None) -> Path | None:
+    """Write ONE setting into .env, leaving every other line and comment exactly as it was.
+
+    Replaces the existing `KEY=...` line (or appends one). The first write of a session copies the
+    old .env to .env.bak. Returns the backup path if one was made now. Raises ValueError/OSError."""
+    env_path = env_path or J.ENV_PATH
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{key} can't contain a line break.")
+    if not env_path.exists():  # no .env yet: build it from .env.example the usual way
+        return save_env_values({key: value}, env_path)
+    old = env_path.read_text(encoding="utf-8")
+    line = f"{key}={env_quote(value)}"
+    pat = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=")
+    lines = old.splitlines()
+    hits = [i for i, ln in enumerate(lines) if pat.match(ln)]
+    if hits:
+        lines[hits[0]] = line
+        for i in reversed(hits[1:]):  # later duplicates would override it; drop them
+            del lines[i]
+    else:
+        lines.append(line)
+    text = "\n".join(lines) + "\n"
+    if dotenv_values(stream=io.StringIO(text), interpolate=False).get(key) != value:
+        raise ValueError(f"Couldn't safely write {key} to .env.")
+    backup = None
+    if str(env_path) not in _env_backed_up:
+        backup = env_path.with_name(env_path.name + ".bak")
+        shutil.copy2(env_path, backup)
+        _env_backed_up.add(str(env_path))
+    tmp = env_path.with_name(env_path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, env_path)
+    return backup
+
+
+def changed_keys(saved: dict[str, str], current: dict[str, str]) -> list[str]:
+    """Settings whose value on screen differs from the saved one."""
+    return [k for k, v in current.items() if v != saved.get(k, "")]
+
+
+BANNER_COLORS = {"ok": ("#14532d", "#bbf7d0"), "restart": ("#78350f", "#fde68a"),
+                 "error": ("#7f1d1d", "#fecaca"), "info": ("#1e3a5f", "#bfdbfe")}
+
+
+class BannerState:
+    """What the Settings banner shows (no widgets, so it's easy to test).
+
+    show() returns (kind, text, sticky). kind is ok/restart/error/info; sticky=False means
+    hide it after ~3 s. Settings that need a restart are remembered until Jarvis restarts, so a later
+    'Settings saved' doesn't hide the restart prompt."""
+
+    def __init__(self) -> None:
+        self.pending_restart: dict[str, str] = {}  # key -> label, e.g. "ASSISTANT_NAME": "assistant name"
+
+    def restart_view(self) -> tuple[str, str, bool]:
+        names = ", ".join(self.pending_restart.values())
+        return "restart", f"Settings saved. Restart Jarvis to use the new {names}.", True
+
+    def saved(self, key: str = "", restart_label: str = "") -> tuple[str, str, bool]:
+        if key and restart_label:
+            self.pending_restart[key] = restart_label
+        if self.pending_restart:
+            return self.restart_view()
+        return "ok", "Settings saved", False
+
+    def error(self, text: str) -> tuple[str, str, bool]:
+        return "error", text, False
+
+    def info(self, text: str, kind: str = "info") -> tuple[str, str, bool]:
+        return kind, text, False
+
+    def after_hide(self) -> tuple[str, str, bool] | None:
+        """When a temporary message times out: go back to the restart prompt if one is pending."""
+        return self.restart_view() if self.pending_restart else None
+
+
+class _BannerLabel:
+    """Stands in for the old bottom status label: anything that used save_msg.configure(...) now
+    shows in the banner (green = ok, amber = info/warning, red = error)."""
+
+    def __init__(self, app: "JarvisApp") -> None:
+        self.app = app
+
+    def configure(self, text: str = "", text_color: str = "", **_kw: Any) -> None:
+        if not text:
+            return
+        kind = {"#86efac": "ok", "#f87171": "error"}.get(text_color, "info")
+        self.app.show_banner(*self.app.banner_state.info(text, kind))
+
+
 class ObsLookupError(Exception):
     """A plain-English reason why asking OBS for its microphones didn't work."""
 
@@ -243,6 +339,50 @@ def find_obs_mics(host: str, port: int, password: str, timeout: float = 4.0,
         with contextlib.suppress(Exception):
             cl.disconnect()
     return list(dict.fromkeys(n for n in names if n))
+
+
+ICON_PATH = J.APP_DIR / "jarvis.ico"
+
+
+def find_pythonw() -> str:
+    """pythonw.exe (Python with no console window) next to the Python running this app."""
+    exe = Path(sys.executable)
+    cand = exe.with_name("pythonw.exe")
+    if cand.exists():
+        return str(cand)
+    return shutil.which("pythonw") or str(exe)
+
+
+def shortcut_command() -> list[str]:
+    """Same PowerShell as create_desktop_shortcut.bat: WScript.Shell makes Desktop\\Jarvis.lnk.
+    Paths go in via environment variables (JV_PYW, JV_DIR) so no quoting tricks are needed."""
+    ps = ("$lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Jarvis.lnk'; "
+          "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk); "
+          "$s.TargetPath = $env:JV_PYW; "
+          "$s.Arguments = [char]34 + (Join-Path $env:JV_DIR 'jarvis_gui.py') + [char]34; "
+          "$s.WorkingDirectory = $env:JV_DIR; "
+          "$ico = Join-Path $env:JV_DIR 'jarvis.ico'; if (Test-Path $ico) { $s.IconLocation = $ico }; "
+          "$s.Description = 'Jarvis voice assistant'; $s.Save(); Write-Output $lnk")
+    return ["powershell", "-NoProfile", "-Command", ps]
+
+
+def create_desktop_shortcut() -> str:
+    """Make the Desktop shortcut (Windows only). Returns the .lnk path; raises on failure."""
+    if os.name != "nt":
+        raise OSError("Desktop shortcuts are only made on Windows.")
+    if not ICON_PATH.exists():
+        try:
+            from make_icon import make_icon
+
+            make_icon(ICON_PATH)
+        except Exception as e:
+            J.log.debug("icon not created: %s", e)
+    env = dict(os.environ, JV_PYW=find_pythonw(), JV_DIR=str(J.APP_DIR))
+    r = subprocess.run(shortcut_command(), env=env, capture_output=True, text=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        raise OSError((r.stderr or r.stdout or "PowerShell failed").strip()[:300])
+    return r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "Desktop\\Jarvis.lnk"
 
 
 def list_windows_voices() -> list[str]:
@@ -395,6 +535,11 @@ class JarvisApp(ctk.CTk):
         self._preview_busy = False
 
         self.title(f"{J.ASSISTANT_NAME} Assistant")
+        if os.name == "nt" and ICON_PATH.exists():
+            try:
+                self.iconbitmap(str(ICON_PATH))  # window + taskbar icon
+            except Exception:
+                pass
         self.geometry("840x720")
         self.minsize(660, 580)
         self.tabs = ctk.CTkTabview(self)
@@ -475,6 +620,19 @@ class JarvisApp(ctk.CTk):
         self.speak_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(bottom, text="Speak replies out loud", variable=self.speak_var).grid(
             row=1, column=0, sticky="w", pady=(8, 0))
+        self.gaming_var = ctk.BooleanVar(value=J.GAMING_MODE)
+        ctk.CTkSwitch(bottom, text="Gaming mode (CPU only, low priority)", variable=self.gaming_var,
+                      command=self.toggle_gaming).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+    def toggle_gaming(self) -> None:
+        on = bool(self.gaming_var.get())
+        J.set_gaming_mode(on)
+        if on:
+            self.chat("system", "Gaming mode on: lower priority and no barge-in right away. Whisper (base) and "
+                                "Kokoro move to the CPU after you restart Jarvis (tray icon > Quit, then start it).")
+        else:
+            self.chat("system", "Gaming mode off: normal priority and barge-in are back now. "
+                                "Restart Jarvis to use the GPU and your usual Whisper model again.")
 
     def _append_chat(self, role: str, text: str) -> None:
         stamp = time.strftime("%I:%M %p").lstrip("0")
@@ -649,8 +807,10 @@ class JarvisApp(ctk.CTk):
     _RESTART_LABELS = {
         "JARVIS_INPUT_DEVICE": "microphone", "JARVIS_VOICE": "Windows voice", "LLM_MODEL": "model",
         "ASSISTANT_NAME": "assistant name", "ELEVENLABS_API_KEY": "ElevenLabs key",
-        "ELEVENLABS_VOICE_ID": "ElevenLabs voice ID",
+        "ELEVENLABS_VOICE_ID": "ElevenLabs voice ID", "JARVIS_TTS_ENGINE": "voice engine",
     }
+    _ENGINE_LABELS = {"Automatic": "", "ElevenLabs": "elevenlabs", "Kokoro (free, offline)": "kokoro",
+                      "Windows voice": "windows"}
 
     @staticmethod
     def _current_env() -> dict[str, str]:
@@ -673,38 +833,113 @@ class JarvisApp(ctk.CTk):
             "OBS_PASSWORD": get("OBS_PASSWORD", J.OBS_PASSWORD),
             "OBS_MIC_INPUT": get("OBS_MIC_INPUT", J.OBS_MIC_INPUT),
             "JARVIS_WAKE_SOUND_VOLUME": get("JARVIS_WAKE_SOUND_VOLUME", f"{J.WAKE_SOUND_VOLUME:g}"),
+            "JARVIS_TTS_ENGINE": get("JARVIS_TTS_ENGINE", J._env("JARVIS_TTS_ENGINE")),
+            "KOKORO_VOICE": get("KOKORO_VOICE", J.KOKORO_VOICE),
         }
 
     def _build_settings_tab(self, tab: ctk.CTkFrame) -> None:
         cur = self._current_env()
         self._cur = cur
-        sc = ctk.CTkScrollableFrame(tab)
-        sc.pack(fill="both", expand=True)
-        sc.columnconfigure(1, weight=1)
-        self._srow = 0
+        # What's saved right now, per setting; each row's Apply button lights up when its value differs.
+        self._saved = dict(cur, JARVIS_WAKE_SOUND_STYLE=J.WAKE_SOUND_STYLE)
+        self._saved["JARVIS_TTS_ENGINE"] = (cur["JARVIS_TTS_ENGINE"] or "").strip().lower()
+        self._saved["KOKORO_VOICE"] = cur["KOKORO_VOICE"].strip() or "bm_george"
+        try:  # same format the slider produces, so "0.30" in .env doesn't count as a change
+            self._saved["JARVIS_WAKE_SOUND_VOLUME"] = f"{round(float(cur['JARVIS_WAKE_SOUND_VOLUME']), 2):g}"
+        except ValueError:
+            pass
+        # Banner pinned above the scrolling area, so it stays visible while you scroll.
+        self.banner_state = BannerState()
+        self._banner_after: str | None = None
+        self.banner = ctk.CTkFrame(tab, corner_radius=10, fg_color=BANNER_COLORS["ok"][0])
+        self.banner.columnconfigure(0, weight=1)
+        self.banner_label = ctk.CTkLabel(self.banner, text="", font=ctk.CTkFont(size=14, weight="bold"),
+                                         wraplength=560, justify="left", anchor="w")
+        self.banner_label.grid(row=0, column=0, sticky="ew", padx=12, pady=8)
+        self.restart_btn = ctk.CTkButton(self.banner, text="Restart Jarvis", width=120,
+                                         fg_color="#d97706", hover_color="#b45309", command=self.restart_app)
+        self.restart_btn.grid(row=0, column=1, padx=(0, 10), pady=6)
+        self.restart_btn.grid_remove()
+        body = ctk.CTkFrame(tab, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        self._settings_body = body
+        # Sub-tabs instead of a scrollbar. CustomTkinter + any canvas scroll stretches text on Windows.
+        pages = ctk.CTkTabview(body)
+        pages.pack(fill="both", expand=True)
+        self._settings_pages = pages
+        self._apply_rows: dict[str, dict] = {}  # key -> {"get", "btn"}  (results show in the top banner)
+
+        def use_page(name: str) -> ctk.CTkFrame:
+            sc = pages.add(name)
+            sc.columnconfigure(1, weight=0, minsize=460)
+            sc.columnconfigure(2, weight=0)
+            self._sc = sc
+            self._srow = 0
+            return sc
 
         def header(text: str) -> None:
-            ctk.CTkLabel(sc, text=text, font=ctk.CTkFont(size=16, weight="bold")).grid(
+            ctk.CTkLabel(self._sc, text=text, font=ctk.CTkFont(size=16, weight="bold")).grid(
                 row=self._srow, column=0, columnspan=2, sticky="w", pady=(14, 4))
             self._srow += 1
 
-        def field(label: str, widget: Any, hint: str = "") -> None:
-            ctk.CTkLabel(sc, text=label).grid(row=self._srow, column=0, sticky="w", padx=(0, 14), pady=4)
-            widget.grid(row=self._srow, column=1, sticky="ew", pady=4)
+        def field(label: str, widget: Any, hint: str = "", key: str = "",
+                  get: Callable[[], str] | None = None) -> None:
+            ctk.CTkLabel(self._sc, text=label).grid(row=self._srow, column=0, sticky="w", padx=(0, 14), pady=4)
+            if isinstance(widget, (ctk.CTkOptionMenu, ctk.CTkEntry, ctk.CTkComboBox)):
+                widget.configure(width=420)
+            elif isinstance(widget, ctk.CTkFrame):
+                widget.configure(width=420)
+            widget.grid(row=self._srow, column=1, sticky="w", pady=4)
+            if key and get is not None:
+                self._add_apply(key, get, self._srow)
             self._srow += 1
             if hint:
-                ctk.CTkLabel(sc, text=hint, text_color="#9ca3af", font=ctk.CTkFont(size=12),
+                ctk.CTkLabel(self._sc, text=hint, text_color="#9ca3af", font=ctk.CTkFont(size=12),
                              wraplength=460, justify="left").grid(row=self._srow, column=1, sticky="w")
                 self._srow += 1
 
+        sc = use_page("Voice")
         header("Voice and audio")
         self.mic_menu = ctk.CTkOptionMenu(sc, values=["Loading microphones..."], dynamic_resizing=False)
         self._mic_map: dict[str, str] = {}
-        field("Microphone", self.mic_menu)
+        field("Microphone", self.mic_menu, key='JARVIS_INPUT_DEVICE',
+              get=lambda: self._mic_map.get(self.mic_menu.get(), self._saved['JARVIS_INPUT_DEVICE']))
 
         self.voice_menu = ctk.CTkOptionMenu(sc, values=["Loading voices..."], dynamic_resizing=False)
         self._voice_map: dict[str, str] = {}
-        field("Windows voice", self.voice_menu, "Used when ElevenLabs isn't set up (or fails).")
+        field("Windows voice", self.voice_menu, "Used when ElevenLabs isn't set up (or fails).",
+              key="JARVIS_VOICE", get=self._voice_value)
+
+        eng_cur = (cur["JARVIS_TTS_ENGINE"] or "").strip().lower()
+        eng_label = next((k for k, v in self._ENGINE_LABELS.items() if v == eng_cur), "Automatic")
+        self.engine_menu = ctk.CTkOptionMenu(sc, values=list(self._ENGINE_LABELS), dynamic_resizing=False)
+        self.engine_menu.set(eng_label)
+        kok_note = "" if J.kokoro_installed() else " Kokoro isn't installed yet (see the README)."
+        field("Voice engine", self.engine_menu,
+              "Automatic = ElevenLabs if you have a key, else Kokoro if installed, else the Windows voice. "
+              "If one fails it falls back to the next." + kok_note, key="JARVIS_TTS_ENGINE",
+              get=lambda: self._ENGINE_LABELS.get(self.engine_menu.get(), ""))
+
+        kokoro_row = ctk.CTkFrame(sc, fg_color="transparent")
+        kokoro_row.columnconfigure(0, weight=1)
+        kv = cur["KOKORO_VOICE"].strip() or "bm_george"
+        def _klabel(code: str) -> str:
+            nm = code.split("_", 1)[-1].capitalize()
+            kind = {"bm": "British man", "bf": "British woman", "am": "American man", "af": "American woman"}.get(code[:2], code)
+            return nm
+        self._kokoro_map = {_klabel(c): c for c in J.KOKORO_VOICES + ([kv] if kv not in J.KOKORO_VOICES else [])}
+        self.kokoro_menu = ctk.CTkOptionMenu(
+            kokoro_row, values=list(self._kokoro_map),
+            dynamic_resizing=False)
+        self.kokoro_menu.set(_klabel(kv))
+        self.kokoro_menu.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.kokoro_preview_btn = ctk.CTkButton(kokoro_row, text="Preview", width=90,
+                                                command=self.preview_kokoro)
+        self.kokoro_preview_btn.grid(row=0, column=1)
+        field("Kokoro voice", kokoro_row,
+              "The first Preview downloads the voice model "
+              "(about 300 MB), so it can take a minute.", key="KOKORO_VOICE",
+              get=lambda: self._kokoro_map.get(self.kokoro_menu.get(), self._saved["KOKORO_VOICE"]))
 
         self._sound_map = {J.wake_label(n): n for n in J.WAKE_SOUND_NAMES + ["random"]}
         sound_row = ctk.CTkFrame(sc, fg_color="transparent")
@@ -715,8 +950,9 @@ class JarvisApp(ctk.CTk):
         self.sound_menu.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.preview_btn = ctk.CTkButton(sound_row, text="Preview", width=90, command=self.preview_sound)
         self.preview_btn.grid(row=0, column=1)
-        field("Wake sound", sound_row, "Plays when it hears the wake word. Takes effect as soon as you pick it. "
-                                       "Preview uses your current volume setting.")
+        field("Wake sound", sound_row, "Plays when it hears the wake word. Takes effect as soon as you pick it; "
+                                       "press Apply to keep it in .env too. Preview uses your current volume.",
+              key="JARVIS_WAKE_SOUND_STYLE", get=lambda: self._sound_map.get(self.sound_menu.get(), "bell"))
 
         try:
             vol0 = max(0.0, min(1.0, float(cur["JARVIS_WAKE_SOUND_VOLUME"])))
@@ -732,8 +968,10 @@ class JarvisApp(ctk.CTk):
         self.volume_label.grid(row=0, column=1)
         field("Wake sound volume", vol_row,
               "How loud the wake sound is. It changes as you slide, so use Preview to hear it. "
-              "Press Save settings to keep it next time. 0% is silent.")
+              "Press Apply to keep it next time. 0% is silent.", key="JARVIS_WAKE_SOUND_VOLUME",
+              get=lambda: f"{round(float(self.volume_slider.get()), 2):g}")
 
+        sc = use_page("Brain")
         header("Brain (LM Studio)")
         model_row = ctk.CTkFrame(sc, fg_color="transparent")
         model_row.columnconfigure(0, weight=1)
@@ -741,27 +979,32 @@ class JarvisApp(ctk.CTk):
         self.model_combo.set(cur["LLM_MODEL"])
         self.model_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ctk.CTkButton(model_row, text="Refresh", width=90, command=self.refresh_models).grid(row=0, column=1)
-        field("Model", model_row)
+        field("Model", model_row, key="LLM_MODEL",
+              get=lambda: self.model_combo.get().strip() or self._saved["LLM_MODEL"])
         self.model_status = ctk.CTkLabel(sc, text="", text_color="#9ca3af", font=ctk.CTkFont(size=12),
                                          wraplength=460, justify="left")
         self.model_status.grid(row=self._srow, column=1, sticky="w")
         self._srow += 1
 
+        sc = use_page("Account")
         header("Names")
         self.name_entry = ctk.CTkEntry(sc)
         self.name_entry.insert(0, cur["ASSISTANT_NAME"])
-        field("Assistant name", self.name_entry, "Changing this doesn't change the wake word (see the README).")
+        field("Assistant name", self.name_entry, "Changing this doesn't change the wake word (see the README).",
+              key="ASSISTANT_NAME", get=lambda: self.name_entry.get().strip())
         self.title_entry = ctk.CTkEntry(sc)
         self.title_entry.insert(0, cur["USER_TITLE"])
         field("What it calls you", self.title_entry,
-              "For example sir, boss or captain. Leave blank for no title. Press Save to apply it.")
+              "For example sir, boss or captain. Leave blank for no title. Press Apply to use it.",
+              key="USER_TITLE", get=lambda: self.title_entry.get().strip())
 
         header("ElevenLabs voice (optional)")
         self.eleven_key = ctk.CTkEntry(sc, show="\u2022")
         self.eleven_key.insert(0, cur["ELEVENLABS_API_KEY"])
         field("API key", self.eleven_key,
               "When you create the key, turn on these permissions: Speech to Text, Text to Speech, "
-              "and Voices (Read). Otherwise ElevenLabs will refuse the key.")
+              "and Voices (Read). Otherwise ElevenLabs will refuse the key.", key="ELEVENLABS_API_KEY",
+              get=lambda: self.eleven_key.get().strip())
         links = ctk.CTkFrame(sc, fg_color="transparent")
         links.grid(row=self._srow, column=1, sticky="w", pady=(0, 4))
         self._srow += 1
@@ -772,14 +1015,20 @@ class JarvisApp(ctk.CTk):
                 command=lambda u=url: self.open_link(u)).grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
         self.eleven_voice = ctk.CTkEntry(sc)
         self.eleven_voice.insert(0, cur["ELEVENLABS_VOICE_ID"])
-        field("Voice ID", self.eleven_voice, f"Free accounts need a default voice, e.g. George: {J.GEORGE_VOICE_ID}")
+        field("Voice ID", self.eleven_voice, f"Free accounts need a default voice, e.g. George: {J.GEORGE_VOICE_ID}",
+              key="ELEVENLABS_VOICE_ID", get=lambda: self.eleven_voice.get().strip())
+        self.show_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(sc, text="Show keys and passwords", variable=self.show_var,
+                        command=self._toggle_secrets).grid(row=self._srow, column=1, sticky="w", pady=(10, 0))
+        self._srow += 1
 
+        sc = use_page("OBS")
         header("OBS Studio (optional)")
         self.obs_pw = ctk.CTkEntry(sc, show="\u2022")
         self.obs_pw.insert(0, cur["OBS_PASSWORD"])
         field("WebSocket password", self.obs_pw,
               "Only needed if you want Jarvis to control OBS (record, stream, scenes, mute your mic). "
-              "Otherwise leave it blank.")
+              "Otherwise leave it blank.", key="OBS_PASSWORD", get=lambda: self.obs_pw.get().strip())
         # A small drop-down: click to show or hide the setup steps.
         self.obs_help_btn = ctk.CTkButton(
             sc, text=self._OBS_HELP_CLOSED, width=0, height=24, anchor="w", fg_color="transparent",
@@ -802,27 +1051,172 @@ class JarvisApp(ctk.CTk):
         self.obs_find_btn.grid(row=0, column=1)
         field("Mic name in OBS", obs_mic_row,
               "Used by 'mute my mic'. Open OBS, enter the password above, then click Find in OBS and pick yours. "
-              "The default, Mic/Aux, is right for most people.")
+              "The default, Mic/Aux, is right for most people.", key="OBS_MIC_INPUT",
+              get=lambda: self.obs_mic_combo.get().strip() or "Mic/Aux")
         self.obs_status = ctk.CTkLabel(sc, text="", text_color="#9ca3af", font=ctk.CTkFont(size=12),
                                        wraplength=460, justify="left")
         self.obs_status.grid(row=self._srow, column=1, sticky="w")
         self._srow += 1
 
-        self.show_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(sc, text="Show keys and passwords", variable=self.show_var,
-                        command=self._toggle_secrets).grid(row=self._srow, column=1, sticky="w", pady=(10, 0))
-        self._srow += 1
+        header("Desktop shortcut")
+        self.shortcut_btn = ctk.CTkButton(sc, text="Create desktop shortcut", width=200,
+                                          command=self.make_shortcut)
+        field("Shortcut", self.shortcut_btn,
+              "Puts a Jarvis icon on your Desktop that opens this window without a black console window.")
 
-        ctk.CTkButton(sc, text="Save settings", height=40, command=self.save_settings).grid(
-            row=self._srow, column=0, columnspan=2, sticky="ew", pady=(18, 6))
-        self._srow += 1
-        self.save_msg = ctk.CTkLabel(sc, text="", wraplength=560, justify="left")
-        self.save_msg.grid(row=self._srow, column=0, columnspan=2, sticky="w")
+        pages.set("Voice")  # open on the first page
+
+        # (The old "Save settings" button is replaced by an Apply button on each row.)
+        self.save_msg = _BannerLabel(self)  # old status label -> the banner at the top
 
         # Fill the dropdowns without freezing the window: do the slow lookups in threads.
         threading.Thread(target=lambda: self.post(self._apply_mics, J.list_input_devices()), daemon=True).start()
         threading.Thread(target=lambda: self.post(self._apply_voices, list_windows_voices()), daemon=True).start()
         self.refresh_models()
+        self.after(300, self._check_dirty)
+
+    # -- per-row Apply buttons -------------------------------------------------
+
+    def _add_apply(self, key: str, get: Callable[[], str], row: int) -> None:
+        # Button goes straight into the grid (an empty holder frame would balloon to 200 px tall).
+        btn = ctk.CTkButton(self._sc, text="Apply", width=64, height=28, state="disabled",
+                            fg_color="#2563eb", command=lambda: self.apply_setting(key))
+        btn.grid(row=row, column=2, sticky="w", padx=(10, 0), pady=4)
+        btn.grid_remove()  # only shown when the value changed
+        self._apply_rows[key] = {"get": get, "btn": btn}
+
+    def _current_values(self) -> dict[str, str]:
+        vals = {}
+        for key, r in self._apply_rows.items():
+            try:
+                vals[key] = r["get"]()
+            except Exception:
+                vals[key] = self._saved.get(key, "")
+        return vals
+
+    def _check_dirty(self) -> None:
+        """Every 300 ms: show/enable Apply on rows whose value differs from the saved one."""
+        if self._closing:
+            return
+        dirty = set(changed_keys(self._saved, self._current_values()))
+        for key, r in self._apply_rows.items():
+            btn = r["btn"]
+            if key in dirty and not btn.winfo_ismapped():
+                btn.grid()
+                btn.configure(state="normal")
+            elif key not in dirty and btn.winfo_ismapped():
+                btn.configure(state="disabled")
+                btn.grid_remove()
+        self.after(300, self._check_dirty)
+
+    def _voice_value(self) -> str:
+        label = self.voice_menu.get()
+        initial = getattr(self, "_voice_initial", None)
+        if initial and label == initial[0]:
+            return initial[1]  # untouched: keep exactly what was in .env (e.g. "david")
+        return self._voice_map.get(label, self._saved["JARVIS_VOICE"])
+
+    def apply_setting(self, key: str) -> None:
+        """Save ONE setting to .env and use it right away when possible."""
+        r = self._apply_rows[key]
+        value = r["get"]()
+        if key == "ASSISTANT_NAME" and not value:
+            self.show_banner(*self.banner_state.error("The assistant name can't be empty."))
+            return
+        try:
+            backup = save_env_value(key, value)
+            if key == "JARVIS_WAKE_SOUND_STYLE":
+                J.save_wake_style(value)  # .cache/settings.json would otherwise override the .env choice
+        except (OSError, ValueError) as e:
+            record_crash("saving a setting failed")
+            self.show_banner(*self.banner_state.error(f"Couldn't save: {e}"))
+            return
+        live = self._apply_live(key, value)
+        self._saved[key] = value
+        if key in self._cur:
+            self._cur[key] = value
+        r["btn"].configure(state="disabled")
+        r["btn"].grid_remove()
+        label = "" if live else self._RESTART_LABELS.get(key, key.lower().replace("_", " "))
+        self.show_banner(*self.banner_state.saved(key, label))
+        if key in ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID") and self._saved.get("ELEVENLABS_API_KEY") \
+                and not self._saved.get("ELEVENLABS_VOICE_ID"):
+            J.log.warning("ElevenLabs needs a Voice ID too, otherwise the Windows voice is used.")
+
+    # -- banner + restart --------------------------------------------------------
+
+    def show_banner(self, kind: str, text: str, sticky: bool) -> None:
+        """Show the top banner. Non-sticky messages hide after ~3 s (each new one restarts the timer)."""
+        if self._banner_after is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._banner_after)
+            self._banner_after = None
+        bg, fg = BANNER_COLORS.get(kind, BANNER_COLORS["info"])
+        self.banner.configure(fg_color=bg)
+        self.banner_label.configure(text=text, text_color=fg)
+        if kind == "restart":
+            self.restart_btn.grid()
+        else:
+            self.restart_btn.grid_remove()
+        if not self.banner.winfo_ismapped():
+            # Sit above the settings body (list + art), still inside the Settings tab.
+            self.banner.pack(fill="x", pady=(0, 8), before=self._settings_body)
+        if not sticky:
+            self._banner_after = self.after(3000, self._banner_timeout)
+
+    def _banner_timeout(self) -> None:
+        self._banner_after = None
+        back = self.banner_state.after_hide()
+        if back:
+            self.show_banner(*back)  # a restart is still needed: keep saying so
+        else:
+            self.banner.pack_forget()
+
+    @staticmethod
+    def relaunch_command() -> list[str]:
+        """Same interpreter (pythonw stays pythonw, so no console pops up) and the same arguments."""
+        script = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else Path(__file__).resolve()
+        return [sys.executable, str(script), *sys.argv[1:]]
+
+    def restart_app(self) -> None:
+        """Start a fresh copy of the app, then quit this one (stops listening, removes the tray icon).
+
+        A full relaunch is used rather than reloading in place: most settings (name, mic, voices, Whisper
+        model/device, LLM model) are read once when jarvis_assistant is imported, so only a new process
+        is sure to pick all of them up and release the mic and GPU memory cleanly."""
+        try:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(self.relaunch_command(), cwd=os.getcwd(), close_fds=True, creationflags=flags)
+        except Exception as e:
+            record_crash("restart failed")
+            self.show_banner(*self.banner_state.error(f"Couldn't restart: {e}. Quit from the tray icon and start it again."))
+            return
+        self.quit_app()
+
+    def _apply_live(self, key: str, value: str) -> bool:
+        """Use the new value in the running assistant. Returns False if it needs a restart."""
+        if key == "JARVIS_WAKE_SOUND_STYLE":
+            return True  # already saved/applied above
+        if key == "JARVIS_WAKE_SOUND_VOLUME":
+            J.WAKE_SOUND_VOLUME = float(value)
+            return True
+        if key == "KOKORO_VOICE":
+            J.KOKORO_VOICE = value  # read each time Kokoro speaks
+            return True
+        if key == "USER_TITLE":
+            if value != J.USER_TITLE:
+                J.set_user_title(value)
+                if self.brain is not None:
+                    with self.brain._ask_lock:
+                        self.brain.history.clear()  # old replies that said "sir" would keep nudging the model
+            return True
+        if key == "OBS_PASSWORD":
+            J.OBS_PASSWORD = value  # read each time an OBS command runs
+            return True
+        if key == "OBS_MIC_INPUT":
+            J.OBS_MIC_INPUT = value
+            return True
+        return False  # microphone, voices, engine, model, name, ElevenLabs: read at start-up
 
     _ELEVEN_LINKS = (
         ("Log in", "https://elevenlabs.io/app/sign-in"),
@@ -843,7 +1237,7 @@ class JarvisApp(ctk.CTk):
         "1. In OBS, open Tools > WebSocket Server Settings.\n"
         "2. Tick 'Enable WebSocket server' (leave the port at 4455).\n"
         "3. Keep 'Enable Authentication' on, click 'Show Connect Info' and copy the Server Password.\n"
-        "4. Paste it above and press Save settings (no restart needed).\n"
+        "4. Paste it above and press Apply next to it (no restart needed).\n"
         "5. Click 'Find in OBS' below and pick your microphone, so 'mute my mic' works.\n\n"
         "If you turn authentication off in OBS, leave the password box blank. This is not an account "
         "login: it only protects the link between OBS and Jarvis on your own PC.")
@@ -882,10 +1276,10 @@ class JarvisApp(ctk.CTk):
         if len(names) == 1 or current not in names:
             self.obs_mic_combo.set(names[0])  # a good starting point; the list lets them change it
         if len(names) == 1:
-            text = f"Found your mic: {names[0]}. Press Save settings to keep it."
+            text = f"Found your mic: {names[0]}. Press Apply to keep it."
         else:
             text = (f"Found {len(names)} microphones in OBS. Pick yours from the list, "
-                    "then press Save settings.")
+                    "then press Apply.")
         self.obs_status.configure(text=text, text_color="#86efac")
 
     def _toggle_obs_help(self) -> None:
@@ -965,7 +1359,7 @@ class JarvisApp(ctk.CTk):
         name = self._sound_map.get(label, "bell")
         J.save_wake_style(name)  # updates the running assistant and .cache/settings.json
         self.save_msg.configure(
-            text=f"Wake sound is now {label}. (Press Save too if you want it written to .env as well.)",
+            text=f"Wake sound is now {label}. (Press Apply too if you want it written to .env as well.)",
             text_color="#86efac")
 
     def _volume_changed(self, value: float) -> None:
@@ -993,6 +1387,52 @@ class JarvisApp(ctk.CTk):
         self._preview_busy = False
         self.preview_btn.configure(state="normal")
 
+    def preview_kokoro(self) -> None:
+        if self._preview_busy:
+            return
+        if not J.kokoro_installed():
+            self.save_msg.configure(text="Kokoro isn't installed. Run: pip install -r requirements-kokoro.txt",
+                                    text_color="#fbbf24")
+            return
+        voice = self._kokoro_map.get(self.kokoro_menu.get(), self.kokoro_menu.get())
+        self._preview_busy = True
+        self.kokoro_preview_btn.configure(state="disabled", text="Loading...")
+
+        def run() -> None:
+            ok = False
+            try:
+                sp = J.Speaker()
+                sp.engine, sp._kokoro_ok = "kokoro", True
+                ok = sp._say_kokoro(f"Hello, I am {J.ASSISTANT_NAME}. How can I help?", voice)
+            except Exception as e:
+                J.log.warning("Kokoro preview failed: %s", e)
+            finally:
+                self.post(self._kokoro_preview_done, ok)
+
+        threading.Thread(target=run, daemon=True, name="kokoro-preview").start()
+
+    def _kokoro_preview_done(self, ok: bool) -> None:
+        self._preview_busy = False
+        self.kokoro_preview_btn.configure(state="normal", text="Preview")
+        if not ok:
+            self.save_msg.configure(text="Kokoro couldn't speak. Check the console/log for details.",
+                                    text_color="#f87171")
+
+    def make_shortcut(self) -> None:
+        self.shortcut_btn.configure(state="disabled")
+
+        def run() -> None:
+            try:
+                path = create_desktop_shortcut()
+                self.post(lambda: self.show_banner(*self.banner_state.info(f"Shortcut created: {path}", "ok")))
+            except Exception as e:
+                msg = f"Couldn't create the shortcut: {e}\nTry create_desktop_shortcut.bat instead."
+                self.post(lambda: self.show_banner(*self.banner_state.error(msg)))
+            finally:
+                self.post(lambda: self.shortcut_btn.configure(state="normal"))
+
+        threading.Thread(target=run, daemon=True, name="shortcut").start()
+
     def save_settings(self) -> None:
         name = self.name_entry.get().strip()
         if not name:
@@ -1012,6 +1452,8 @@ class JarvisApp(ctk.CTk):
             "OBS_PASSWORD": self.obs_pw.get().strip(),
             "OBS_MIC_INPUT": self.obs_mic_combo.get().strip() or "Mic/Aux",
             "JARVIS_WAKE_SOUND_VOLUME": f"{round(float(self.volume_slider.get()), 2):g}",
+            "JARVIS_TTS_ENGINE": self._ENGINE_LABELS.get(self.engine_menu.get(), ""),
+            "KOKORO_VOICE": self._kokoro_map.get(self.kokoro_menu.get(), "bm_george"),
         }
         initial = getattr(self, "_voice_initial", None)
         if initial and voice_label == initial[0]:
@@ -1034,6 +1476,9 @@ class JarvisApp(ctk.CTk):
                 with self.brain._ask_lock:
                     self.brain.history.clear()  # old replies that said "sir" would keep nudging the model
             applied.append("what it calls you")
+        if updates["KOKORO_VOICE"] != J.KOKORO_VOICE:
+            J.KOKORO_VOICE = updates["KOKORO_VOICE"]  # read each time Kokoro speaks, so it's live
+            applied.append("Kokoro voice")
         # OBS password and mic name are read each time an OBS command runs, so they apply live too.
         if updates["OBS_PASSWORD"] != J.OBS_PASSWORD or updates["OBS_MIC_INPUT"] != J.OBS_MIC_INPUT:
             J.OBS_PASSWORD = updates["OBS_PASSWORD"]

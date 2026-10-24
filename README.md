@@ -151,17 +151,20 @@ Use **either** the console version **or** the desktop app, not both at once (the
 - Dropdowns: **microphone** (from sounddevice), **Windows voice** (installed voices), **wake sound** (with a **Preview**
   button) and **LM Studio model** (from `/v1/models`; press **Refresh** after starting LM Studio, or type a name).
 - **Wake sound volume** slider (0-100%, default 30%). It changes as you slide, so use **Preview** to hear it; press
-  Save to keep it (`JARVIS_WAKE_SOUND_VOLUME`).
+  Apply to keep it (`JARVIS_WAKE_SOUND_VOLUME`).
 - Fields: assistant name, what it calls you, ElevenLabs key (hidden) and voice ID, OBS password (hidden) and OBS mic
   name. Tick "Show keys and passwords" to see them. Under the OBS password there is a **How to set this up** drop-down
   with the steps, and a **Find in OBS** button: with OBS open, it lists your OBS microphones so you can pick yours
   (no need to edit any files).
-- **Save settings** copies your current `.env` to `.env.bak`, then writes the new values. Settings you didn't touch
-  (thresholds, Whisper model, and so on) are kept as they are.
+- Each setting has its own **Apply** button that appears when you change it. Apply saves just that one setting to
+  `.env` (every other line and comment stays as it is; the first save of a session copies your old `.env` to `.env.bak`).
+  A banner at the top of the Settings tab (it stays put while you scroll) says **Settings saved** for a few seconds.
+  If a setting is only read at start-up, the banner stays amber ("Restart Jarvis to use the new ...") with a
+  **Restart Jarvis** button that closes the app and opens it again. Errors show in red in the same place.
 - **Applied immediately, no restart:** the **wake sound** (as soon as you pick it in the dropdown; it's stored in
-  `.cache/settings.json`, which overrides `.env`), **what it calls you** (when you press Save; the chat history is
-  cleared so earlier replies don't keep using the old title) and the **OBS password and mic name** (when you press Save).
-- **Need a restart** (the Save message lists which ones you changed): microphone, Windows voice, model, assistant
+  `.cache/settings.json`, which overrides `.env`), **what it calls you** (when you press Apply; the chat history is
+  cleared so earlier replies don't keep using the old title) and the **OBS password and mic name** (when you press Apply).
+- **Need a restart** (the banner offers a **Restart Jarvis** button): microphone, Windows voice, model, assistant
   name and ElevenLabs key/voice ID. Use the tray icon > **Quit**, then start the app again.
 - Microphone numbers can change when devices are plugged in or out (virtual mics like Voicemod re-number them).
   If your mic stops working, re-pick it here and save.
@@ -181,6 +184,25 @@ Use **either** the console version **or** the desktop app, not both at once (the
 While gaming, free the GPU: load **Qwen3 1.7B** in LM Studio with GPU offload set to 0 (CPU only),
 set `LLM_MODEL=qwen3-1.7b`, and `WHISPER_DEVICE=cpu`, `WHISPER_MODEL=tiny` or `base`.
 
+## Gaming mode (for streamers and older graphics cards)
+Gaming mode keeps Jarvis out of your game's and stream's way (handy on a GTX 1070 that's also streaming).
+Turn it on with the **Gaming mode** switch on the Assistant tab, by saying "*Jarvis, gaming mode on*"
+(or "turn off gaming mode"), or with `JARVIS_GAMING_MODE=1` in `.env`. While it's on:
+- Speech recognition (Whisper) and the Kokoro voice run on the **CPU** (int8), leaving the graphics card alone.
+- Whisper uses the smaller **base** model (change it with `JARVIS_GAMING_WHISPER_MODEL`, e.g. `tiny`).
+- Jarvis runs at **below-normal priority**, so the game always wins.
+- **Barge-in is off** (it keeps listening for the wake word while talking, which costs a bit of CPU).
+
+Priority and barge-in change straight away. Moving Whisper/Kokoro to the CPU needs a **restart** of Jarvis.
+The switch/voice choice is remembered in `.cache/settings.json` and overrides `.env`.
+For the language model itself, see the tip above (LM Studio GPU offload).
+
+## Desktop shortcut
+Double-click **`create_desktop_shortcut.bat`** (or press **Create desktop shortcut** in Settings). It puts a
+**Jarvis** icon on your Desktop (also works with a OneDrive Desktop) that opens the app with no black console window.
+No admin rights needed and nothing is downloaded. Run it again any time, e.g. after moving the folder.
+The icon is `jarvis.ico` (redraw it with `python make_icon.py`).
+
 ## OBS Studio control
 Jarvis can drive OBS Studio 28+ through its built-in WebSocket server (`obsws-python`, installed via requirements.txt).
 
@@ -197,6 +219,37 @@ Things to say: "start recording", "stop recording", "go live" / "start streaming
 (the Replay Buffer must be started in OBS), and "am I live?" / "am I recording?".
 Jarvis only starts streaming when you clearly say "go live" or "start streaming". Scene names don't need to match exactly.
 If OBS isn't running or WebSocket is off, Jarvis tells you so instead of failing.
+
+## Free offline voice (Kokoro)
+
+[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) is a free voice that runs on your own PC (no account,
+no internet after the first download). It sounds much more natural than the built-in Windows voice. It's optional.
+
+1. Open a terminal in the Jarvis folder (the same place you ran `pip install -r requirements.txt`) and run:
+   ```
+   pip install -r requirements-kokoro.txt
+   ```
+   This is a big download (it includes PyTorch), so give it a few minutes. Kokoro needs Python 3.10–3.12 (3.12 is fine).
+2. Start Jarvis. In the desktop app go to **Settings**, set **Voice engine** to **Kokoro (free, offline)**,
+   pick a **Kokoro voice** (`bm_george` is the default British butler voice; also `bm_lewis`, `bm_daniel`, `bm_fable`,
+   or female `bf_emma`, `bf_isabella`, `bf_alice`, `bf_lily`) and press **Preview** to hear it. Then press **Apply** next to each one
+   and restart Jarvis. (Or set `JARVIS_TTS_ENGINE=kokoro` and `KOKORO_VOICE=bm_george` in `.env`.)
+3. The **first time** it speaks it downloads the voice model (about 300 MB) and a small English language pack,
+   so the first sentence can take a minute. After that it starts quickly.
+
+Notes:
+- If you leave Voice engine on **Automatic**, Jarvis uses ElevenLabs when you have a key, otherwise Kokoro if it's
+  installed, otherwise the Windows voice. If ElevenLabs fails (no internet, out of credits) it falls back to Kokoro, then the Windows voice.
+  If Kokoro isn't installed it is simply skipped. Barge-in (saying the wake word to cut it off) works with Kokoro too.
+- `KOKORO_DEVICE=auto|cpu|cuda` (default `auto`). Kokoro is small and runs fine on the CPU. The normal
+  `pip install` gives you CPU-only PyTorch on Windows, which is fine. To use an NVIDIA card, install a CUDA build of
+  PyTorch from [pytorch.org](https://pytorch.org/get-started/locally/) (RTX 50-series cards like the 5070 Ti need the
+  CUDA 12.8 or newer build). If the GPU doesn't work it falls back to the CPU automatically.
+- Streaming on an older card (e.g. GTX 1070)? Set `KOKORO_DEVICE=cpu` so the voice doesn't compete with your game/stream for the GPU.
+- **espeak-ng:** you normally do **not** need to install it. The `kokoro` package pulls in `espeakng-loader`, which
+  ships its own copy of espeak-ng (used only for unusual words that aren't in Kokoro's dictionary). If you ever see an
+  espeak error in the log, install espeak-ng from its [releases page](https://github.com/espeak-ng/espeak-ng/releases)
+  (download the `.msi`, run it) and restart Jarvis.
 
 ## Troubleshooting
 - "Can't reach my brain" → LM Studio server isn't running / wrong `LLM_BASE_URL`.

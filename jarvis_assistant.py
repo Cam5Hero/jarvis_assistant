@@ -162,6 +162,103 @@ ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID = _env("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 ELEVENLABS_OUTPUT_FORMAT = _env("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000")
 
+# --- Kokoro (free offline voice, optional: pip install -r requirements-kokoro.txt) ---
+KOKORO_RATE = 24000  # Kokoro always outputs 24 kHz mono float audio
+# British voices (lang_code 'b'). bm_ = British male, bf_ = British female.
+KOKORO_VOICES = ["bm_george", "bm_lewis", "bm_daniel", "bm_fable",
+                 "bf_emma", "bf_isabella", "bf_alice", "bf_lily"]
+KOKORO_VOICE = _env("KOKORO_VOICE", "bm_george")
+KOKORO_DEVICE = _env("KOKORO_DEVICE", "auto").lower()  # auto | cpu | cuda
+TTS_ENGINES = ("elevenlabs", "kokoro", "windows")
+
+
+def kokoro_installed() -> bool:
+    """True if the optional kokoro package is installed (doesn't import torch yet)."""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("kokoro") is not None
+    except Exception:
+        return False
+
+
+def resolve_tts_engine(value: str | None = None) -> str:
+    """JARVIS_TTS_ENGINE, or a sensible default: ElevenLabs if a key is set, else Kokoro if installed,
+    else the built-in Windows voice."""
+    v = (value if value is not None else _env("JARVIS_TTS_ENGINE")).strip().lower()
+    if v in ("pyttsx3", "sapi", "system"):
+        v = "windows"
+    if v in TTS_ENGINES:
+        return v
+    if v:
+        log.warning("Unknown JARVIS_TTS_ENGINE %r; picking automatically.", v)
+    if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
+        return "elevenlabs"
+    return "kokoro" if kokoro_installed() else "windows"
+
+
+def _kokoro_device(want: str = "") -> str:
+    want = (want or KOKORO_DEVICE or "auto").lower()
+    if want in ("cpu", "cuda"):
+        return want
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+_kokoro_lock = threading.Lock()
+_kokoro_pipe: list = [None, ""]  # [KPipeline, device]; loaded once, shared by Speaker and Preview
+
+
+def load_kokoro(device: str = "") -> Any:
+    """Load the Kokoro pipeline on first use (downloads ~300 MB the very first time).
+    Returns None if kokoro isn't installed or fails to load; never raises."""
+    with _kokoro_lock:
+        if _kokoro_pipe[0] is not None:
+            return _kokoro_pipe[0]
+        if not kokoro_installed():
+            return None
+        dev = _kokoro_device(device)
+        try:
+            from kokoro import KPipeline
+
+            try:
+                pipe = KPipeline(lang_code="b", repo_id="hexgrad/Kokoro-82M", device=dev)
+            except Exception as e:
+                if dev != "cuda":
+                    raise
+                log.warning("Kokoro on GPU failed (%s); using CPU.", e)
+                dev = "cpu"
+                pipe = KPipeline(lang_code="b", repo_id="hexgrad/Kokoro-82M", device=dev)
+            _kokoro_pipe[0], _kokoro_pipe[1] = pipe, dev
+            log.info("TTS: Kokoro loaded on %s", dev)
+            return pipe
+        except Exception as e:
+            log.warning("Kokoro unavailable (%s)", e)
+            return None
+
+
+def kokoro_chunks(text: str, voice: str = "", pipe: Any = None):
+    """Yield int16 numpy arrays (24 kHz mono), one per sentence-ish chunk."""
+    import numpy as np
+
+    pipe = pipe or load_kokoro()
+    if pipe is None:
+        return
+    voice = voice or KOKORO_VOICE or "bm_george"
+    for result in pipe(text, voice=voice, speed=1):
+        audio = result[2] if isinstance(result, tuple) else getattr(result, "audio", None)
+        if audio is None:
+            continue
+        if hasattr(audio, "detach"):
+            audio = audio.detach().cpu().numpy()
+        a = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
+        yield (a * 32767).astype(np.int16)
+
+
 def build_system_prompt() -> str:
     """The model's instructions. A function so the title can be changed while running (set_user_title)."""
     return (
@@ -212,7 +309,7 @@ def add_closing(reply: str) -> str:
 
 
 class Speaker:
-    """Speaks text via ElevenLabs (if configured) or pyttsx3. Thread-safe."""
+    """Speaks text via ElevenLabs, Kokoro (offline) or pyttsx3, per JARVIS_TTS_ENGINE. Thread-safe."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -221,7 +318,9 @@ class Speaker:
         self._engine: Any = None  # current pyttsx3 engine (so stop() can reach it)
         self._pcm_stream: Any = None  # open RawOutputStream while ElevenLabs audio is playing
         self._eleven = None
-        if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
+        self.engine = resolve_tts_engine()
+        self._kokoro_ok = kokoro_installed()  # set False after a load failure so we stop retrying
+        if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID and self.engine == "elevenlabs":
             try:
                 from elevenlabs.client import ElevenLabs
 
@@ -229,8 +328,13 @@ class Speaker:
                 log.info("TTS: ElevenLabs voice %s", ELEVENLABS_VOICE_ID)
             except Exception as e:  # ImportError or client error
                 log.warning("ElevenLabs unavailable (%s); using pyttsx3.", e)
+        if self._eleven is None and self.engine == "elevenlabs":
+            self.engine = "kokoro" if self._kokoro_ok else "windows"
+        if self.engine == "kokoro" and not self._kokoro_ok:
+            log.warning("Kokoro isn't installed (pip install -r requirements-kokoro.txt); using pyttsx3.")
+            self.engine = "windows"
         if self._eleven is None:
-            log.info("TTS: pyttsx3")
+            log.info("TTS: %s", "Kokoro voice " + KOKORO_VOICE if self.engine == "kokoro" else "pyttsx3")
 
     def _pcm_rate(self) -> int:
         try:
@@ -305,6 +409,46 @@ class Speaker:
                 except Exception:
                     pass
 
+    def _say_kokoro(self, text: str, voice: str = "") -> bool:
+        """Speak with Kokoro through the same sounddevice stream path as ElevenLabs (so stop() works).
+        Returns False (nothing spoken) if Kokoro isn't available, so the caller can fall back."""
+        if not self._kokoro_ok:
+            return False
+        got_any = False
+        stream = None
+        try:
+            pipe = load_kokoro()
+            if pipe is None:
+                self._kokoro_ok = False
+                return False
+            import sounddevice as sd
+
+            for audio in kokoro_chunks(text, voice, pipe):
+                if self.interrupted.is_set():
+                    break
+                if stream is None:
+                    stream = sd.RawOutputStream(
+                        samplerate=KOKORO_RATE, channels=1, dtype="int16", blocksize=0, latency="low")
+                    stream.start()
+                    self._pcm_stream = stream
+                got_any = True
+                stream.write(audio.tobytes())
+            return got_any or self.interrupted.is_set()
+        except Exception as e:
+            if got_any or self.interrupted.is_set():
+                log.warning("Kokoro TTS ended early: %s", e)
+                return True
+            log.warning("Kokoro TTS failed: %s", e)
+            return False
+        finally:
+            self._pcm_stream = None
+            if stream is not None:
+                for fn in (stream.stop, stream.close):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+
     def _say_pyttsx3(self, text: str) -> None:
         try:
             import pyttsx3
@@ -349,7 +493,7 @@ class Speaker:
                 stream.abort()
             except Exception as e:
                 log.debug("pcm stream abort failed: %s", e)
-        if self._eleven is not None:
+        if self._eleven is not None or self.engine == "kokoro":
             try:
                 import sounddevice as sd
 
@@ -372,7 +516,13 @@ class Speaker:
             self.interrupted.clear()
             self.speaking.set()
             try:
-                if not (self._eleven and self._say_eleven(text)):
+                # Fallback order: ElevenLabs -> Kokoro (if installed) -> Windows voice (pyttsx3).
+                done = False
+                if self.engine == "elevenlabs" and self._eleven:
+                    done = self._say_eleven(text)
+                if not done and self.engine in ("elevenlabs", "kokoro"):
+                    done = self._say_kokoro(text)
+                if not done:
                     self._say_pyttsx3(text)
             finally:
                 if not self.interrupted.is_set():
@@ -467,6 +617,104 @@ def set_scan_consent(value: bool) -> None:
         SETTINGS_PATH.write_text(json.dumps(d, indent=1))
     except OSError as e:
         log.warning("Could not save settings: %s", e)
+
+
+# --- gaming mode: keep the GPU and CPU free for games / streaming ---
+# Stored like the wake sound: .cache/settings.json ("gaming_mode", set by voice or the GUI switch) > .env > off.
+GAMING_WHISPER_MODEL = _env("JARVIS_GAMING_WHISPER_MODEL", "base")
+
+
+def gaming_config(on: bool, whisper_model: str = "", whisper_device: str = "", kokoro_device: str = "",
+                  barge_in: bool = True, gaming_whisper_model: str = "base") -> dict:
+    """What gaming mode changes (pure function, easy to test). On: Whisper + Kokoro on CPU (int8),
+    a smaller Whisper model (JARVIS_GAMING_WHISPER_MODEL, default base), no barge-in (it keeps the
+    wake-word model running while speaking), and below-normal process priority."""
+    if not on:
+        return {"whisper_model": whisper_model, "whisper_device": whisper_device,
+                "kokoro_device": kokoro_device, "barge_in": barge_in, "low_priority": False}
+    return {"whisper_model": gaming_whisper_model or "base", "whisper_device": "cpu",
+            "kokoro_device": "cpu", "barge_in": False, "low_priority": True}
+
+
+def resolve_gaming_mode() -> bool:
+    v = load_settings().get("gaming_mode")
+    return v if isinstance(v, bool) else _env_bool("JARVIS_GAMING_MODE", False)
+
+
+def set_low_priority(low: bool = True) -> bool:
+    """Windows: BELOW_NORMAL priority so games win (NORMAL when low=False). Best effort; never raises."""
+    try:
+        import psutil
+
+        p = psutil.Process()
+        if os.name == "nt":
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if low else psutil.NORMAL_PRIORITY_CLASS)
+        else:
+            p.nice(10 if low else 0)
+        return True
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug("psutil priority failed: %s", e)
+        return False
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        return bool(k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000 if low else 0x20))
+    except Exception as e:
+        log.debug("SetPriorityClass failed: %s", e)
+        return False
+
+
+_NORMAL_CONFIG = {"whisper_model": WHISPER_MODEL, "whisper_device": WHISPER_DEVICE,
+                  "kokoro_device": KOKORO_DEVICE, "barge_in": BARGE_IN}
+
+
+def _apply_gaming(on: bool) -> dict:
+    global WHISPER_MODEL, WHISPER_DEVICE, KOKORO_DEVICE, BARGE_IN, GAMING_MODE
+    cfg = gaming_config(on, gaming_whisper_model=GAMING_WHISPER_MODEL, **_NORMAL_CONFIG)
+    WHISPER_MODEL, WHISPER_DEVICE = cfg["whisper_model"], cfg["whisper_device"]
+    KOKORO_DEVICE, BARGE_IN = cfg["kokoro_device"], cfg["barge_in"]
+    GAMING_MODE = on
+    return cfg
+
+
+GAMING_MODE = False
+if resolve_gaming_mode():
+    _apply_gaming(True)
+    set_low_priority(True)
+
+
+def set_gaming_mode(on: bool) -> str:
+    """Turn gaming mode on/off now and remember it (.cache/settings.json). Priority and barge-in change
+    right away; Whisper (and Kokoro, if already loaded) switch device/model on the next restart."""
+    d = load_settings()
+    d["gaming_mode"] = bool(on)
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(d, indent=1))
+    except OSError as e:
+        log.warning("Could not save settings: %s", e)
+    _apply_gaming(bool(on))
+    set_low_priority(bool(on))
+    if on:
+        return T("Gaming mode on, {t}. I'll keep out of your game's way. "
+                 "Restart me to move my speech models to the CPU.")
+    return T("Gaming mode off, {t}. Restart me to use the faster speech models again.")
+
+
+def _quick_gaming(text: str) -> str | None:
+    """'gaming mode on/off', 'turn on gaming mode', 'enable/disable gaming mode' (also 'game mode')."""
+    t = re.sub(r"[^a-z ]", " ", (text or "").lower())
+    m = (re.search(r"\bgam(?:e|ing) mode (on|off)\b", t)
+         or re.search(r"\b(?:turn|switch|put) (on|off) (?:the )?gam(?:e|ing) mode\b", t)
+         or re.search(r"\b(enable|disable|start|stop|exit|leave|enter) (?:the )?gam(?:e|ing) mode\b", t))
+    if not m:
+        return None
+    return set_gaming_mode(m.group(1) in ("on", "enable", "start", "enter"))
 
 
 # --- wake sound choice (single source of truth; saved in .cache/settings.json as 'wake_sound') ---
@@ -1592,7 +1840,9 @@ class Brain:
                      user_text, re.I):
             rescan_apps()
             return T("Scanning your apps now, {t}. I'll tell you when I'm done.")
-        quick = _quick_sound(user_text)
+        quick = _quick_gaming(user_text)
+        if quick is None:
+            quick = _quick_sound(user_text)
         if quick is None:
             quick = _quick_media(user_text)
         if quick is not None:
@@ -2440,8 +2690,28 @@ def list_input_devices(sd: Any = None) -> list[tuple[int, str]]:
     try:
         if sd is None:
             import sounddevice as sd
-        return [(i, str(d.get("name", f"device {i}"))) for i, d in enumerate(sd.query_devices())
-                if int(d.get("max_input_channels", 0) or 0) > 0]
+        devs = list(enumerate(sd.query_devices()))
+        try:
+            main_api = int(sd.default.hostapi)  # MME on Windows: one entry per mic
+        except Exception:
+            main_api = None
+        out, seen = [], set()
+        for i, d in devs:
+            if int(d.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            name = str(d.get("name", f"device {i}"))
+            if main_api is not None and d.get("hostapi") not in (None, main_api):
+                continue  # same mic listed again by another Windows audio system
+            if name.lower().startswith(("microsoft sound mapper", "primary sound capture")) or name.endswith("()"):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append((i, name))
+        if not out:  # never hide everything
+            out = [(i, str(d.get("name", f"device {i}"))) for i, d in devs
+                   if int(d.get("max_input_channels", 0) or 0) > 0]
+        return out
     except Exception as e:
         log.warning("Could not list audio devices: %s", e)
         return []

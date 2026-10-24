@@ -1,0 +1,4 @@
+# Optional: free offline voice (Kokoro). Install with:  pip install -r requirements-kokoro.txt
+# Needs Python 3.10-3.12. The first time it speaks it downloads the voice model (~300 MB).
+kokoro>=0.9.4
+soundfile
