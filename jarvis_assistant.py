@@ -2,7 +2,7 @@
 Jarvis voice assistant (v1: "ask Jarvis anything") for Windows / Python 3.12.
 
 Pipeline:
-  "hey jarvis" (openwakeword) -> chime -> record until silence (RMS VAD)
+  wake word (openwakeword, JARVIS_WAKE_MODEL) -> chime -> record until silence (RMS VAD)
   -> faster-whisper transcription -> LM Studio (OpenAI-compatible) with tool calling
   -> speak reply (ElevenLabs if configured, else pyttsx3).
 
@@ -53,6 +53,49 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# --- naming: what the assistant calls itself / the user (spoken name is just a setting) ---
+ASSISTANT_NAME = _env("ASSISTANT_NAME", "Jarvis")
+USER_TITLE = (os.environ.get("USER_TITLE", "sir") or "").strip()  # blank = no title
+
+
+def T(text: str) -> str:
+    """Fill the user's title: '{t}' (lowercase spot) / '{T}' (sentence start).
+    With a blank title, drop it and its comma: 'Done, {t}.' -> 'Done.'"""
+    if USER_TITLE:
+        return text.replace("{T}", USER_TITLE[:1].upper() + USER_TITLE[1:]).replace("{t}", USER_TITLE)
+    text = re.sub(r",?\s*\{t\}", "", text)
+    text = re.sub(r"\{T\},?\s*", "", text).strip()
+    return text[:1].upper() + text[1:]
+
+
+# --- wake word: built-in openwakeword name or path to a custom .onnx model ---
+BUILTIN_WAKE_MODELS = ("hey_jarvis", "alexa", "hey_mycroft", "hey_rhasspy")
+WAKE_MODEL = _env("JARVIS_WAKE_MODEL", "hey_jarvis")
+
+
+def wake_model_key(model: str = "") -> str:
+    """'models/hey_friday_v0.1.onnx' -> 'hey_friday' (base used to match prediction keys)."""
+    base = os.path.basename((model or WAKE_MODEL).replace("\\", "/"))
+    base = re.sub(r"\.(onnx|tflite)$", "", base, flags=re.I)
+    return re.sub(r"_v\d+(\.\d+)*$", "", base).lower()
+
+
+def wake_phrase(model: str = "") -> str:
+    """Friendly spoken form: 'hey_jarvis' -> 'Hey Jarvis'."""
+    return " ".join(w.capitalize() for w in re.split(r"[_\-\s]+", wake_model_key(model)) if w)
+
+
+def wake_score(scores: dict, model: str = "") -> float:
+    """Score for the configured model; keys may carry version suffixes, so match on the base."""
+    if not scores:
+        return 0.0
+    key = wake_model_key(model)
+    hits = [v for k, v in scores.items() if wake_model_key(str(k)) == key or str(k).lower().startswith(key)]
+    return float(max(hits if hits else scores.values()))
+
+
+WAKE_PHRASE = wake_phrase()
+
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 1280  # 80 ms frames, what openwakeword expects
 
@@ -82,8 +125,8 @@ FOLLOWUP_END_PHRASES = [
 PAUSE_PHRASES = [p.strip().lower() for p in _env(
     "JARVIS_PAUSE_PHRASES", "stop listening,go to sleep,mute yourself,pause listening").split(",")
     if p.strip()]
-PAUSE_REPLY = "Going quiet, sir. Say hey Jarvis when you need me."
-RESUME_REPLY = "At your service, sir."
+PAUSE_REPLY = T(f"Going quiet, {{t}}. Say {WAKE_PHRASE} when you need me.")
+RESUME_REPLY = T("At your service, {t}.")
 
 ELEVENLABS_API_KEY = _env("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID")
@@ -91,10 +134,12 @@ ELEVENLABS_MODEL_ID = _env("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 ELEVENLABS_OUTPUT_FORMAT = _env("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000")
 
 SYSTEM_PROMPT = (
-    "You are Jarvis, a witty, polite British AI butler. Your replies are spoken aloud, "
+    f"You are {ASSISTANT_NAME}, a witty, polite British AI butler. Your replies are spoken aloud, "
     "so answer in 1-3 short sentences of plain conversational English. Never use "
     "markdown, lists, code blocks, emojis or URLs read character by character. "
-    "Address the user as 'sir' occasionally. Use the provided tools when the user asks "
+    + (f"Address the user as '{USER_TITLE}' occasionally. " if USER_TITLE
+       else "Do not use 'sir', 'madam' or other titles for the user. ")
+    + "Use the provided tools when the user asks "
     "for the time, to open a website, search the web, open an app, set a timer, "
     "or control OBS (record, stream, scenes, mic mute, replay clips, live status). Only start "
     "streaming when the user clearly asked to go live. "
@@ -102,15 +147,28 @@ SYSTEM_PROMPT = (
     "assist you further?'; a closing line is added for you."
 )
 
-CLOSING_PHRASE = _env("JARVIS_CLOSING_PHRASE", "Let me know if you need anything else.")
+_DEFAULT_CLOSINGS = (
+    "Let me know if you need anything else.|Anything else I can do for you?|"
+    "I'm here if you need me.|Just say the word if you need anything.|"
+    "Happy to help.|Always a pleasure.|Standing by.|Ready when you are."
+)
+# JARVIS_CLOSING_PHRASE: one phrase, or several separated by | (picked at random). Blank = none.
+CLOSING_PHRASES = [p.strip() for p in _env("JARVIS_CLOSING_PHRASE", _DEFAULT_CLOSINGS).split("|") if p.strip()]
+CLOSING_PHRASE = CLOSING_PHRASES[0] if CLOSING_PHRASES else ""
+_last_closing = [""]
 
 
 def add_closing(reply: str) -> str:
-    """Append the closing phrase unless the reply is a question or already offers help."""
+    """Append a random closing phrase (no repeats back to back) unless the reply is a question or already offers help."""
     r = reply.strip()
-    if not CLOSING_PHRASE or not r or r.endswith("?") or "anything else" in r.lower():
+    low = r.lower()
+    if not CLOSING_PHRASES or not r or r.endswith("?") or "anything else" in low or "need me" in low:
         return r
-    return f"{r} {CLOSING_PHRASE}"
+    import random
+    choices = [p for p in CLOSING_PHRASES if p != _last_closing[0]] or CLOSING_PHRASES
+    pick = random.choice(choices)
+    _last_closing[0] = pick
+    return f"{r} {pick}"
 
 # ---------------------------------------------------------------------------
 # Text-to-speech
@@ -193,7 +251,7 @@ class Speaker:
         text = text.strip()
         if not text:
             return
-        print(f"Jarvis: {text}")
+        print(f"{ASSISTANT_NAME}: {text}")
         with self._lock:
             self.speaking.set()
             try:
@@ -210,7 +268,7 @@ class PrintSpeaker:
     speaking = threading.Event()
 
     def say(self, text: str) -> None:
-        print(f"Jarvis: {text.strip()}")
+        print(f"{ASSISTANT_NAME}: {text.strip()}")
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +317,8 @@ def web_search(query: str) -> str:
 APP_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "app_index.json"
 APP_CACHE_MAX_AGE = 24 * 3600
 SETTINGS_PATH = APP_CACHE_PATH.parent / "settings.json"
-CONSENT_QUESTION = "Would you like me to scan your PC so I can open your apps for you?"
-CONSENT_DECLINED = "No problem, sir. Say scan my apps any time."
+CONSENT_QUESTION = f"{ASSISTANT_NAME} here. Would you like me to scan your PC so I can open your apps for you?"
+CONSENT_DECLINED = T("No problem, {t}. Say scan my apps any time.")
 
 
 # --- opt-in consent (stored in .cache/settings.json: app_scan_consent true/false/null) ---
@@ -540,7 +598,7 @@ def list_apps(filter: str = "") -> str:  # noqa: A002 (tool arg name)
 
 
 def _announce_count(n: int) -> None:
-    _speaker.say(f"Done, sir. I found {n} apps I can open for you.")
+    _speaker.say(T(f"Done, {{t}}. I found {n} apps I can open for you."))
 
 
 def rescan_apps() -> str:
@@ -572,7 +630,7 @@ def ask_scan_consent(speaker: Any, get_reply: Callable[[], str]) -> bool | None:
     print(f"You: {reply}" if reply else "[no reply]")
     if reply and _YES_RE.search(reply) and not _NO_RE.search(reply):
         set_scan_consent(True)
-        speaker.say("Very good, sir. Scanning now; I'll let you know when I'm done.")
+        speaker.say(T("Very good, {t}. Scanning now; I'll let you know when I'm done."))
         APP_INDEX.rescan_async(on_done=_announce_count)
         return True
     set_scan_consent(False)
@@ -801,7 +859,7 @@ def set_timer(seconds: float, label: str = "timer") -> str:
     label = (label or "timer").strip()
 
     def _done() -> None:
-        _speaker.say(f"Sir, your {label} is done.")
+        _speaker.say(T(f"{{T}}, your {label} is done."))
 
     t = threading.Timer(seconds, _done)
     t.daemon = True
@@ -819,8 +877,8 @@ OBS_PORT = int(_env_float("OBS_PORT", 4455))
 OBS_PASSWORD = _env("OBS_PASSWORD")
 OBS_MIC_INPUT = _env("OBS_MIC_INPUT", "Mic/Aux")
 OBS_TIMEOUT = _env_float("OBS_TIMEOUT", 3.0)
-OBS_UNAVAILABLE = ("I can't reach OBS, sir. Make sure OBS is running and the WebSocket server is on, "
-                   "under Tools, WebSocket Server Settings.")
+OBS_UNAVAILABLE = T("I can't reach OBS, {t}. Make sure OBS is running and the WebSocket server is on, "
+                    "under Tools, WebSocket Server Settings.")
 _GO_LIVE_RE = re.compile(r"\b(go(ing)? live|start(ing)? (the |my )?stream(ing)?|begin (the |my )?stream"
                          r"|stream now|start broadcasting)\b", re.I)
 
@@ -840,7 +898,7 @@ def _obs_client():
     except Exception as e:  # refused, timeout, auth failure...
         log.warning("OBS connect failed: %s", e)
         if "auth" in str(e).lower() or "password" in str(e).lower():
-            raise ObsUnavailable("OBS rejected the password, sir. Check OBS_PASSWORD in the .env file.") from e
+            raise ObsUnavailable(T("OBS rejected the password, {t}. Check OBS_PASSWORD in the .env file.")) from e
         raise ObsUnavailable(OBS_UNAVAILABLE) from e
 
 
@@ -892,7 +950,7 @@ def obs_stream(action: str = "start") -> str:
             if active:
                 return "You're already live."
             cl.start_stream()
-            return "You're live, sir."
+            return T("You're live, {t}.")
         if action == "stop":
             if not active:
                 return "You're not streaming."
@@ -1095,7 +1153,7 @@ class Brain:
         if re.search(r"\b(re-?scan|scan|refresh|re-?index)\b.*\b(apps|applications|games|programs)\b",
                      user_text, re.I):
             rescan_apps()
-            return "Scanning your apps now, sir. I'll tell you when I'm done."
+            return T("Scanning your apps now, {t}. I'll tell you when I'm done.")
         content = user_text + (" /no_think" if LLM_NO_THINK else "")
         self.history.append({"role": "user", "content": content})
         self._trim()
@@ -1105,7 +1163,7 @@ class Brain:
                 msg = self._chat(msgs).choices[0].message
                 calls = getattr(msg, "tool_calls", None) or []
                 if not calls:  # plain answer
-                    reply = add_closing(clean_reply(msg.content) or "I'm afraid I have nothing to add, sir.")
+                    reply = add_closing(clean_reply(msg.content) or T("I'm afraid I have nothing to add, {t}."))
                     self.history.append({"role": "assistant", "content": reply})
                     return reply
                 self.history.append({
@@ -1124,7 +1182,7 @@ class Brain:
             # Too many tool rounds: ask for a final answer without tools.
             msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history
             reply = clean_reply(self._chat(msgs, use_tools=False).choices[0].message.content)
-            reply = add_closing(reply or "Done, sir.")
+            reply = add_closing(reply or T("Done, {t}."))
             self.history.append({"role": "assistant", "content": reply})
             return reply
         except Exception as e:
@@ -1136,11 +1194,11 @@ class Brain:
         name = type(e).__name__
         log.warning("LLM error: %s: %s", name, e)
         if "Connection" in name or "Timeout" in name:
-            return ("I can't reach my brain, sir. Please start the LM Studio server on "
-                    f"{LLM_BASE_URL}.")
+            return (T("I can't reach my brain, {t}. Please start the LM Studio server on "
+                    f"{LLM_BASE_URL}."))
         if "NotFound" in name:
-            return f"LM Studio doesn't have the model {LLM_MODEL} loaded, sir."
-        return "Something went wrong with my language model, sir."
+            return T(f"LM Studio doesn't have the model {LLM_MODEL} loaded, {{t}}.")
+        return T("Something went wrong with my language model, {t}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1230,10 +1288,21 @@ class Ears:
             openwakeword.utils.download_models()  # no-op once cached
         except Exception as e:
             log.warning("openwakeword model download failed: %s", e)
+        model = WAKE_MODEL
+        if model.lower() not in BUILTIN_WAKE_MODELS:
+            path = Path(model).expanduser()
+            if not path.is_absolute():
+                path = Path(__file__).resolve().parent / path
+            if not path.is_file():
+                raise FileNotFoundError(f"JARVIS_WAKE_MODEL: no built-in model or file named {model!r}")
+            model = str(path)
+        else:
+            model = model.lower()
+        log.info("wake model: %s (say %r)", model, WAKE_PHRASE)
         try:
-            self.wake = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+            self.wake = Model(wakeword_models=[model], inference_framework="onnx")
         except TypeError:  # older/newer API variants
-            self.wake = Model(wakeword_models=["hey_jarvis"])
+            self.wake = Model(wakeword_models=[model])
         self.whisper = self._load_whisper()
 
     @staticmethod
@@ -1257,7 +1326,7 @@ class Ears:
                     self.wake.reset()
                     continue
                 scores = self.wake.predict(frame[:, 0])
-                if max(scores.values(), default=0) >= WAKE_THRESHOLD:
+                if wake_score(scores) >= WAKE_THRESHOLD:
                     self.wake.reset()
                     return
 
@@ -1324,8 +1393,9 @@ def is_end_phrase(text: str) -> bool:
     if is_pause_phrase(text):
         return False
     t = re.sub(r"[^a-z' ]+", " ", text.lower()).strip()
-    t = re.sub(r"^(ok(ay)?|alright|no|jarvis)\s+", "", t)
-    t = re.sub(r"\s+(jarvis|sir|mate)$", "", t).strip()
+    names = "|".join(re.escape(n.lower()) for n in {"jarvis", ASSISTANT_NAME, USER_TITLE or "sir"} if n)
+    t = re.sub(rf"^(ok(ay)?|alright|no|{names})\s+", "", t)
+    t = re.sub(rf"\s+({names}|sir|mate)$", "", t).strip()
     return any(t == p or (t.startswith(p) and len(t) <= len(p) + 12) for p in FOLLOWUP_END_PHRASES)
 
 
@@ -1361,7 +1431,7 @@ def conversation(ears: Any, brain: Any, speaker: Any, *, followup_seconds: float
             state.set(True)
             return
         if not first and is_end_phrase(text):
-            speaker.say("Very good, sir.")
+            speaker.say(T("Very good, {t}."))
             print("[follow-up ended - back to wake word]")
             return
         speaker.say(brain.ask(text))  # blocks; mic isn't read while speaking
@@ -1406,7 +1476,7 @@ def text_loop(brain: Brain, speaker: Any) -> None:
 
 def voice_loop(brain: Brain, speaker: Any) -> None:
     ears = Ears()
-    speaker.say("Jarvis online.")
+    speaker.say(f"{ASSISTANT_NAME} online.")
     if get_scan_consent() is None:
         def _voice_reply() -> str:
             audio = ears.record_utterance(start_timeout=6.0)
@@ -1414,7 +1484,7 @@ def voice_loop(brain: Brain, speaker: Any) -> None:
         ask_scan_consent(speaker, _voice_reply)
     state = PauseState()
     poll = lambda: poll_keyboard(state)  # noqa: E731
-    print("Say 'hey Jarvis'... (press 'p' to pause/resume, Ctrl+C to quit)")
+    print(f"Say '{WAKE_PHRASE}'... (press 'p' to pause/resume, Ctrl+C to quit)")
     while True:
         ears.wait_for_wake(speaker.speaking, poll=poll)
         if state.paused:
@@ -1423,12 +1493,12 @@ def voice_loop(brain: Brain, speaker: Any) -> None:
             chime()
         conversation(ears, brain, speaker, state=state, poll=poll)
         if not state.paused:
-            print("Say 'hey Jarvis'...")
+            print(f"Say '{WAKE_PHRASE}'...")
 
 
 def main() -> int:
     global _speaker
-    ap = argparse.ArgumentParser(description="Jarvis voice assistant")
+    ap = argparse.ArgumentParser(description=f"{ASSISTANT_NAME} voice assistant")
     ap.add_argument("--text", action="store_true", help="type instead of talk (no mic)")
     ap.add_argument("--mute", action="store_true", help="print replies instead of speaking")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1450,7 +1520,7 @@ def main() -> int:
     except ImportError as e:
         print(f"Missing dependency ({e}). Run: pip install -r requirements.txt  (or use --text)")
         return 1
-    print("Goodbye, sir.")
+    print(T("Goodbye, {t}."))
     return 0
 
 

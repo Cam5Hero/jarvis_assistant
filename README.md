@@ -102,3 +102,26 @@ If OBS isn't running or WebSocket is off, Jarvis tells you so instead of failing
 - CUDA Whisper needs cuBLAS 12 / cuDNN 9 (e.g. `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` and add their `bin` dirs to PATH).
   A 1 s warm-up at load detects missing DLLs and falls back to CPU int8; a CUDA error during transcription also
   triggers a one-time reload on CPU. Set `WHISPER_DEVICE=cpu` to skip CUDA entirely.
+
+## Renaming your assistant
+
+The name the assistant uses for itself is just a setting. In your `.env`:
+
+```
+ASSISTANT_NAME=Friday     # used in the system prompt ("You are Friday..."), greeting ("Friday online."), console and the app-scan question
+USER_TITLE=boss           # what it calls you; leave blank (USER_TITLE=) for no title at all
+JARVIS_WAKE_MODEL=hey_jarvis
+```
+
+With a blank `USER_TITLE`, lines like "Done, sir." become "Done." and the model is told not to use titles.
+Settings keep the `JARVIS_` prefix, and the file stays `jarvis_assistant.py`, whatever name you pick.
+
+**The wake word is a separate thing.** Changing `ASSISTANT_NAME` does not change what you say to wake it up.
+The wake word comes from an openWakeWord model, and `JARVIS_WAKE_MODEL` accepts:
+
+- a built-in model: `hey_jarvis` (default), `alexa`, `hey_mycroft` or `hey_rhasspy`
+- a path to a custom-trained `.onnx` model, e.g. `JARVIS_WAKE_MODEL=models/hey_friday.onnx` (relative paths are from this folder)
+
+The console prompt and the pause message use a friendly name taken from the model ("hey_mycroft" becomes "Hey Mycroft"; `hey_friday_v0.1.onnx` becomes "Hey Friday"). Pausing still works the same way: say the wake word to resume.
+
+To get a wake word like "Hey Friday", you need to train a custom model. The openWakeWord project has a notebook for training custom models, linked in its README: https://github.com/dscripka/openWakeWord
