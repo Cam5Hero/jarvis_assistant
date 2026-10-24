@@ -11,3 +11,4 @@ obsws-python
 customtkinter
 pystray
 pillow
+truststore

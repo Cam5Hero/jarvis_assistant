@@ -34,6 +34,13 @@ from typing import Any, Callable
 
 from dotenv import load_dotenv
 
+try:  # Trust the Windows certificate store. Needed when antivirus (e.g. Norton) re-signs HTTPS traffic,
+    import truststore  # otherwise ElevenLabs fails with CERTIFICATE_VERIFY_FAILED. Optional.
+
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = APP_DIR / ".env"
 ENV_EXAMPLE_PATH = APP_DIR / ".env.example"
@@ -123,11 +130,14 @@ WAKE_SOUND = _env_bool("JARVIS_WAKE_SOUND", True)
 WAKE_SOUND_VOLUME = max(0.0, min(1.0, _env_float("JARVIS_WAKE_SOUND_VOLUME", 0.3)))
 WAKE_SOUND_STYLE = _env("JARVIS_WAKE_SOUND_STYLE", "bell")
 WAKE_SOUND_FILE = _env("JARVIS_WAKE_SOUND_FILE", "")
+# Seconds of silence played before each wake sound. USB and Bluetooth headphones often swallow the first
+# ~0.1 s of a new sound while they wake up, which made short sounds (beep, blip...) inaudible. 0 = off.
+WAKE_SOUND_PREROLL = max(0.0, min(1.0, _env_float("JARVIS_WAKE_SOUND_PREROLL", 0.2)))
 # Barge-in: say the wake word while the assistant talks to cut it off. Higher threshold so
 # the assistant's own voice (through speakers) doesn't trigger it. Headphones work best.
 BARGE_IN = _env_bool("JARVIS_BARGE_IN", True)
 BARGE_IN_THRESHOLD = _env_float("JARVIS_BARGE_IN_THRESHOLD", 0.7)
-SILENCE_SECONDS = _env_float("JARVIS_SILENCE_SECONDS", 1.2)
+SILENCE_SECONDS = _env_float("JARVIS_SILENCE_SECONDS", 0.75)
 MAX_RECORD_SECONDS = _env_float("JARVIS_MAX_RECORD_SECONDS", 10.0)
 VAD_RMS_THRESHOLD = _env_float("JARVIS_VAD_RMS", 500.0)  # int16 RMS; raise in noisy rooms
 INPUT_DEVICE = _env("JARVIS_INPUT_DEVICE") or None
@@ -209,6 +219,7 @@ class Speaker:
         self.speaking = threading.Event()  # set while audio plays; listener pauses
         self.interrupted = threading.Event()  # set by stop(); cleared at the start of each say()
         self._engine: Any = None  # current pyttsx3 engine (so stop() can reach it)
+        self._pcm_stream: Any = None  # open RawOutputStream while ElevenLabs audio is playing
         self._eleven = None
         if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
             try:
@@ -228,28 +239,71 @@ class Speaker:
             return 24000
 
     def _say_eleven(self, text: str) -> bool:
+        """Stream ElevenLabs PCM to the speakers as chunks arrive, so speech starts sooner.
+
+        Collects ~60 ms first (avoids empty-buffer clicks on USB headphones), then writes each
+        new chunk straight to a low-latency RawOutputStream. Barge-in aborts the stream."""
+        got_any = False
+        stream = None
         try:
-            import numpy as np
             import sounddevice as sd
 
-            chunks = self._eleven.text_to_speech.convert(
+            rate = self._pcm_rate()
+            start_bytes = max(2, int(rate * 0.06) * 2)  # ~60 ms of int16 mono before opening stream
+            buf = bytearray()
+
+            def flush(force: bool = False) -> None:
+                nonlocal buf, stream, got_any
+                n = len(buf) - (len(buf) % 2)  # int16 frames need an even byte count
+                if n == 0:
+                    return
+                if stream is None:
+                    if not force and n < start_bytes:
+                        return
+                    stream = sd.RawOutputStream(
+                        samplerate=rate, channels=1, dtype="int16", blocksize=0, latency="low")
+                    stream.start()
+                    self._pcm_stream = stream
+                data = bytes(buf[:n])
+                del buf[:n]
+                if not data:
+                    return
+                got_any = True
+                stream.write(data)
+
+            for chunk in self._eleven.text_to_speech.convert(
                 voice_id=ELEVENLABS_VOICE_ID,
                 text=text,
                 model_id=ELEVENLABS_MODEL_ID,
                 output_format=ELEVENLABS_OUTPUT_FORMAT,
-            )
-            raw = b"".join(chunks)
-            if not raw:
-                return False
-            if self.interrupted.is_set():  # stopped while still downloading
-                return True
-            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            sd.play(pcm, self._pcm_rate())
-            sd.wait()  # returns early when stop() calls sd.stop()
-            return True
+            ):
+                if self.interrupted.is_set():
+                    break
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                flush()
+            if not self.interrupted.is_set():
+                flush(force=True)  # play the last partial buffer
+            return got_any or self.interrupted.is_set()
         except Exception as e:
+            # Already spoke some of the reply: don't fall back to pyttsx3 (would re-read it).
+            if got_any or self.interrupted.is_set():
+                log.warning("ElevenLabs TTS ended early: %s", e)
+                return True
             log.warning("ElevenLabs TTS failed: %s", e)
             return False
+        finally:
+            self._pcm_stream = None
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     def _say_pyttsx3(self, text: str) -> None:
         try:
@@ -285,10 +339,16 @@ class Speaker:
     def stop(self) -> None:
         """Cut speech off now (barge-in). Safe to call from any thread, also when silent.
 
-        ElevenLabs PCM: sd.stop() ends playback and wakes sd.wait(). pyttsx3: engine.stop()
-        from another thread; on Windows SAPI5 this usually ends speech at the next word but
-        it is best effort (some drivers finish the current sentence)."""
+        ElevenLabs PCM: abort the live RawOutputStream (and sd.stop() as a belt-and-braces).
+        pyttsx3: engine.stop() from another thread; on Windows SAPI5 this usually ends speech
+        at the next word but it is best effort (some drivers finish the current sentence)."""
         self.interrupted.set()
+        stream = self._pcm_stream
+        if stream is not None:
+            try:
+                stream.abort()
+            except Exception as e:
+                log.debug("pcm stream abort failed: %s", e)
         if self._eleven is not None:
             try:
                 import sounddevice as sd
@@ -413,7 +473,7 @@ def set_scan_consent(value: bool) -> None:
 
 WAKE_SOUND_STYLES: list[tuple[str, str, str]] = [  # (name, friendly label, category)
     ("bell", "Bell", "Classic"), ("chime3", "Three-note chime", "Classic"),
-    ("droplet", "Water droplet", "Classic"), ("beep", "Two-tone beep", "Classic"),
+    ("beep", "Two-tone beep", "Classic"),
     ("warp", "Warp", "Space"), ("comms", "Starship comms", "Space"), ("cosmos", "Cosmos", "Space"),
     ("sonar", "Sonar ping", "Space"), ("blip", "Sci-fi blip", "Space"),
     ("piano", "Piano", "Instruments"), ("acoustic_guitar", "Acoustic guitar", "Instruments"),
@@ -427,14 +487,23 @@ WAKE_SOUND_STYLES: list[tuple[str, str, str]] = [  # (name, friendly label, cate
     ("synth_lead", "Synth lead", "Instruments"), ("organ", "Organ", "Instruments"),
     ("taiko", "Taiko drum", "Instruments"),
     ("chug", "Metal palm-mute chug", "Fun"), ("powerup", "Power-up", "Fun"), ("chirp", "Bird chirp", "Fun"),
+    ("radio_click", "Radio click", "Radio"), ("roger_beep", "Roger beep", "Radio"),
+    ("talkabout", "Walkie talkie call tone", "Radio"), ("police_radio", "Police radio chirp", "Radio"),
+    ("cb_radio", "CB radio kerchunk", "Radio"), ("ham_radio", "Ham radio courtesy tone", "Radio"),
+    ("military_radio", "Military radio double click", "Radio"), ("squelch_tail", "Squelch tail", "Radio"),
 ]
 WAKE_SOUND_NAMES = [n for n, _, _ in WAKE_SOUND_STYLES]
-WAKE_SOUND_CATEGORIES = ["Classic", "Space", "Instruments", "Fun"]
+WAKE_SOUND_CATEGORIES = ["Classic", "Space", "Instruments", "Fun", "Radio"]
 _WAKE_ALIASES = {
+    "radio": "radio_click", "click": "radio_click", "push to talk": "radio_click", "ptt": "radio_click",
+    "roger": "roger_beep", "over": "roger_beep", "walkie": "talkabout", "walkie talkie": "talkabout",
+    "police": "police_radio", "cop radio": "police_radio", "cb": "cb_radio", "kerchunk": "cb_radio",
+    "ham": "ham_radio", "military": "military_radio", "army radio": "military_radio",
+    "squelch": "squelch_tail", "over and out": "squelch_tail",
     "guitar": "acoustic_guitar", "acoustic": "acoustic_guitar", "saxophone": "sax", "synth": "synth_lead",
     "synthesizer": "synth_lead", "drum": "taiko", "drums": "taiko", "taiko drum": "taiko",
     "steel drums": "steel_drum", "steel pan": "steel_drum", "musicbox": "music_box", "vibes": "vibraphone",
-    "chime": "chime3", "three chime": "chime3", "drop": "droplet", "power up": "powerup", "ping": "sonar",
+    "chime": "chime3", "three chime": "chime3", "power up": "powerup", "ping": "sonar",
     "bird": "chirp", "default": "bell", "original": "beep", "shuffle": "random", "surprise me": "random",
 }
 _last_random_style = ""
@@ -1184,7 +1253,7 @@ def _obs_client():
     except Exception as e:  # refused, timeout, auth failure...
         log.warning("OBS connect failed: %s", e)
         if "auth" in str(e).lower() or "password" in str(e).lower():
-            raise ObsUnavailable(T("OBS rejected the password, {t}. Check OBS_PASSWORD in the .env file.")) from e
+            raise ObsUnavailable(T("OBS rejected the password, {t}. Please check the OBS password in the settings.")) from e
         raise ObsUnavailable(OBS_UNAVAILABLE) from e
 
 
@@ -1403,7 +1472,7 @@ def play_wake_style(name: str, sd: Any = None) -> None:
     try:
         if sd is None:
             import sounddevice as sd
-        tone = make_chime(WAKE_SOUND_VOLUME, style=name)
+        tone = with_preroll(make_chime(WAKE_SOUND_VOLUME, style=name))
         sd.play(tone, CHIME_RATE)
         sd.wait()
     except Exception as e:
@@ -2021,8 +2090,9 @@ def _instrument_chime(style: str, rate: int = CHIME_RATE):
                     + 0.12 * np.sin(tau * 5.8 * f * t) * np.exp(-t * 40)) * np.exp(-t * 6) * np.minimum(1, t / 0.0005)
         out = _place([(0, _comb(2093.0)), (0.12, _comb(2637.0)), (0.24, _comb(3136.0))], 0.69)
     elif style == "banjo":  # twangy bright roll, G-D-g
-        out = _place([(0.06 * i, _ks(f, 0.45, 0.99) * np.exp(-_t(0.45) * 6)) for i, f in enumerate((392.0, 587.33, 783.99))], 0.6)
+        out = _place([(0.06 * i, _ks(f, 0.45, 0.99) * np.exp(-_t(0.45) * 4)) for i, f in enumerate((392.0, 587.33, 783.99))], 0.6)
         out = out - 0.6 * np.concatenate([np.zeros(12), out[:-12]])  # bright drum-head comb
+        out = np.tanh(2.5 * out / (float(np.max(np.abs(out))) or 1.0))  # gentle saturation: plucks were far too quiet
     elif style == "sitar":  # buzzy jawari with sympathetic shimmer
         t = _t(0.85)
         s = _ks(277.18, 0.85, 0.998)
@@ -2051,23 +2121,120 @@ def _instrument_chime(style: str, rate: int = CHIME_RATE):
         out = tone * _adsr(len(t), 0.005, 0.05, 1.0, 0.08) + click
     elif style == "taiko":  # deep drum hit with a small rim click
         t = _t(0.7)
-        f = 55 + 70 * np.exp(-t * 30)
-        body = np.sin(tau * np.cumsum(f) / rate) * np.exp(-t * 6) + 0.3 * np.sin(tau * 1.6 * np.cumsum(f) / rate) * np.exp(-t * 12)
-        skin = _lp(rng.uniform(-1, 1, len(t)), 800) * np.exp(-t * 40) * 1.5
+        f = 85 + 110 * np.exp(-t * 30)
+        ph = tau * np.cumsum(f) / rate
+        body = 0.55 * np.sin(ph) * np.exp(-t * 6) + 0.2 * np.sin(1.6 * ph) * np.exp(-t * 12)
+        # Overtones of the drum pitch: laptop/phone speakers and most headphones can't play 60-150 Hz,
+        # so without these the hit was almost inaudible.
+        over = (1.2 * np.sin(2 * ph) + 1.0 * np.sin(3 * ph) + 0.7 * np.sin(4 * ph)
+                + 0.45 * np.sin(5 * ph)) * np.exp(-t * 9)
+        skin = _lp(rng.uniform(-1, 1, len(t)), 2500) * np.exp(-t * 30) * 2.5
         rim = _place([(0.0, (np.sin(tau * 3200 * _t(0.03)) + rng.uniform(-1, 1, int(rate * 0.03)))
-                      * np.exp(-_t(0.03) * 200) * 0.25)], 0.7)
-        out = np.tanh(1.3 * (body + skin)) + rim
+                      * np.exp(-_t(0.03) * 200) * 0.5)], 0.7)
+        out = np.tanh(1.3 * (body + over + skin)) + rim
     else:
         return None
     return np.nan_to_num(out)
 
 
+def _radio_chime(style: str, rate: int = CHIME_RATE):
+    """Handheld-radio wake sounds (pure numpy): push-to-talk clicks, squelch static and 'over' beeps.
+    These are synthesized imitations of the general style of each kind of radio, not recordings of real models.
+    Returns an un-normalized float array, or None if `style` is not a radio sound."""
+    if style not in ("radio_click", "roger_beep", "talkabout", "police_radio", "cb_radio", "ham_radio",
+                     "military_radio", "squelch_tail"):
+        return None
+    import numpy as np
+
+    tau = 2 * np.pi
+    rng = np.random.default_rng(23)
+
+    def _t(sec):
+        return np.arange(int(rate * sec)) / rate
+
+    def _band(x, lo, hi):
+        # keep only lo..hi Hz, like the small speaker in a handheld radio (FFT filter with soft edges)
+        n = len(x)
+        spec = np.fft.rfft(x)
+        f = np.fft.rfftfreq(n, 1 / rate)
+        gain = np.clip((f - lo) / (0.4 * lo + 1.0), 0, 1) * np.clip((hi - f) / (0.4 * hi + 1.0), 0, 1)
+        return np.fft.irfft(spec * gain, n)
+
+    def _click(dur=0.03, level=1.0, pitch=1100.0):
+        # push-to-talk button: a sharp tick plus a tiny plastic 'thock'
+        t = _t(dur)
+        tick = rng.uniform(-1, 1, len(t)) * np.exp(-t * 450)
+        thock = np.sin(tau * pitch * t) * np.exp(-t * 240)
+        return level * (0.9 * tick + 0.9 * thock)
+
+    def _hiss(dur, level=0.6, decay=0.0, lo=450.0, hi=3200.0):
+        # band-limited static; decay > 0 fades it out like a squelch tail
+        t = _t(dur)
+        env = np.minimum(1, t / 0.004) * np.exp(-t * decay)
+        return level * 3.0 * _band(rng.uniform(-1, 1, len(t)), lo, hi) * env
+
+    def _beep(freq, dur, level=1.0, glide=0.0, odd=0.3):
+        # radio beep: a slightly square tone (odd harmonics); glide = fractional pitch change over the beep
+        t = _t(dur)
+        ph = tau * np.cumsum(freq * (1 + glide * t / max(dur, 1e-6))) / rate
+        x = np.sin(ph) + odd * np.sin(3 * ph) + 0.5 * odd * np.sin(5 * ph)
+        return level * x * np.minimum(1, t / 0.004) * np.minimum(1, (dur - t) / 0.008)
+
+    def _place(parts, total):
+        out = np.zeros(int(rate * total))
+        for st, sig in parts:
+            s = int(rate * st)
+            m = min(len(sig), len(out) - s)
+            out[s:s + m] += sig[:m]
+        return out
+
+    lo, hi, drive = 300.0, 4500.0, 2.0  # speaker pass-band and how hard the audio is squashed
+    if style == "radio_click":  # key up: click, a burst of static, click
+        out = _place([(0.0, _click(0.03, 1.0)), (0.01, _hiss(0.17, 0.55, decay=14)),
+                      (0.2, _click(0.02, 0.6, pitch=900))], 0.4)
+        drive = 4.0
+    elif style == "roger_beep":  # 'over': end-of-transmission beep, then the unkey click and squelch tail
+        out = _place([(0.0, _beep(1750, 0.14, 0.9)), (0.17, _click(0.025, 0.9)),
+                      (0.18, _hiss(0.2, 0.5, decay=16))], 0.42)
+    elif style == "talkabout":  # family walkie-talkie call tone: three rising notes
+        out = _place([(0.0, _click(0.025, 0.8)), (0.05, _beep(1046, 0.08, 0.8)),
+                      (0.15, _beep(1319, 0.08, 0.8)), (0.25, _beep(1760, 0.14, 0.9))], 0.45)
+        drive = 0.8
+    elif style == "police_radio":  # squelch crash, then the double rising 'talk permit' chirp
+        out = _place([(0.0, _click(0.03, 1.0)), (0.01, _hiss(0.09, 0.8, decay=25)),
+                      (0.11, _beep(900, 0.1, 0.8, glide=0.5, odd=0.5)),
+                      (0.25, _beep(900, 0.1, 0.8, glide=0.5, odd=0.5))], 0.4)
+        drive = 1.0
+    elif style == "cb_radio":  # kerchunk: a heavy clunk, crackly static, a short low blip
+        crackle = (rng.random(int(rate * 0.3)) > 0.992) * rng.uniform(-1, 1, int(rate * 0.3))
+        crackle = np.convolve(crackle, np.exp(-np.arange(40) / 6.0))[:len(crackle)] * np.exp(-_t(0.3) * 6)
+        out = _place([(0.0, _click(0.06, 1.1, pitch=380)), (0.02, _hiss(0.3, 0.7, decay=7, lo=300, hi=2800)),
+                      (0.02, 1.2 * crackle), (0.34, _beep(700, 0.08, 0.7, odd=0.5))], 0.5)
+        lo, hi, drive = 250.0, 3000.0, 3.0
+    elif style == "ham_radio":  # repeater: brief squelch tail, then a soft two-tone courtesy beep
+        out = _place([(0.0, _click(0.02, 0.6, pitch=900)), (0.0, _hiss(0.14, 0.4, decay=25)),
+                      (0.2, _beep(880, 0.09, 0.8, odd=0.1)), (0.3, _beep(1320, 0.13, 0.8, odd=0.1))], 0.5)
+        drive = 1.4
+    elif style == "military_radio":  # key-key: two quick mic clicks with a puff of static, a faint tick
+        out = _place([(0.0, _click(0.025, 1.0)), (0.012, _hiss(0.06, 0.5, decay=30)),
+                      (0.13, _click(0.025, 1.0)), (0.142, _hiss(0.09, 0.55, decay=22)),
+                      (0.28, _beep(1000, 0.05, 0.4, odd=0.5))], 0.4)
+        drive = 2.5
+    else:  # squelch_tail: 'shhhk-click' as the static fades out and the key is released
+        out = _place([(0.0, _hiss(0.36, 0.9, decay=7)), (0.37, _click(0.03, 1.0))], 0.45)
+    out = _band(out, lo, hi)
+    out = np.tanh(drive * out / (np.max(np.abs(out)) or 1.0))  # squash like a cheap radio speaker; evens out loudness
+    return np.nan_to_num(out)
+
+
 def make_chime(volume: float = WAKE_SOUND_VOLUME, freqs: tuple[float, ...] | None = None,
                tone_s: float = 0.0, gap_s: float = 0.0, rate: int = CHIME_RATE, style: str | None = None):
-    """Wake sound. JARVIS_WAKE_SOUND_STYLE: bell (default), warp, comms, cosmos, chug, chime3, droplet, sonar, powerup, chirp,
+    """Wake sound. JARVIS_WAKE_SOUND_STYLE: bell (default), warp, comms, cosmos, chug, chime3, sonar, powerup, chirp,
     blip (quick rising sci-fi blip), or beep (the original two tones).
     Instruments: piano, acoustic_guitar, harp, violin, cello, trumpet, sax, flute, clarinet, marimba,
-    xylophone, vibraphone, steel_drum, kalimba, music_box, banjo, sitar, synth_lead, organ, taiko. float32 mono."""
+    xylophone, vibraphone, steel_drum, kalimba, music_box, banjo, sitar, synth_lead, organ, taiko.
+    Radios: radio_click, roger_beep, talkabout, police_radio, cb_radio, ham_radio, military_radio, squelch_tail.
+    float32 mono."""
     import numpy as np
 
     style = pick_play_style(style)
@@ -2076,6 +2243,8 @@ def make_chime(volume: float = WAKE_SOUND_VOLUME, freqs: tuple[float, ...] | Non
         return np.arange(int(rate * sec)) / rate
 
     inst = _instrument_chime(style, rate)
+    if inst is None:
+        inst = _radio_chime(style, rate)
     if inst is not None:
         out = inst
     elif style == "warp":  # rising sci-fi sweep with airy whoosh, like jumping to lightspeed
@@ -2145,10 +2314,6 @@ def make_chime(volume: float = WAKE_SOUND_VOLUME, freqs: tuple[float, ...] | Non
             st = int(rate * 0.07 * i)
             t = np.arange(total - st) / rate
             out[st:] += np.sin(2 * np.pi * fr * t) * np.minimum(1, t / 0.003) * np.exp(-t * 9)
-    elif style == "droplet":  # water drop: fast downward-then-up pitch sweep
-        t = _t(0.12)
-        f = 1800 * np.exp(-t * 30) + 500 + 900 * (t / t[-1]) ** 3
-        out = np.sin(2 * np.pi * np.cumsum(f) / rate) * np.exp(-t * 25) * np.minimum(1, t / 0.002)
     elif style == "sonar":  # single sonar ping with a long soft tail
         t = _t(0.7)
         out = (np.sin(2 * np.pi * 1200 * t) + 0.2 * np.sin(2 * np.pi * 2400 * t)) \
@@ -2221,6 +2386,16 @@ def _load_wake_wav(rate: int = CHIME_RATE):
         return None
 
 
+def with_preroll(tone):
+    """Put WAKE_SOUND_PREROLL seconds of silence in front of a sound (see that setting for why)."""
+    import numpy as np
+
+    n = int(CHIME_RATE * WAKE_SOUND_PREROLL)
+    if n <= 0 or len(tone) == 0:
+        return tone
+    return np.concatenate([np.zeros(n, dtype=tone.dtype), tone])
+
+
 def chime(volume: float | None = None, enabled: bool | None = None, sd: Any = None) -> None:
     """Wake chime (~0.16 s). Played to completion BEFORE recording starts, so it barely
     reaches the mic. Never raises; times out quickly if the audio device hangs."""
@@ -2233,6 +2408,7 @@ def chime(volume: float | None = None, enabled: bool | None = None, sd: Any = No
         custom = _load_wake_wav()
         tone = (custom * max(0.0, min(1.0, v / max(WAKE_SOUND_VOLUME, 1e-6)))).astype(custom.dtype) \
             if custom is not None else make_chime(v)
+        tone = with_preroll(tone)
         sd.play(tone, CHIME_RATE)
         done = threading.Event()
         threading.Thread(target=lambda: (sd.wait(), done.set()), daemon=True).start()

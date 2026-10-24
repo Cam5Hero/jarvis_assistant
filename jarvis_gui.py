@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -200,6 +201,48 @@ def save_env_values(updates: dict[str, str], env_path: Path | None = None,
     if bad:
         raise ValueError("Couldn't safely write these values to .env: " + ", ".join(bad))
     return J.write_env(quoted, env_path, example_path)
+
+
+class ObsLookupError(Exception):
+    """A plain-English reason why asking OBS for its microphones didn't work."""
+
+
+def find_obs_mics(host: str, port: int, password: str, timeout: float = 4.0,
+                  client_factory: Callable[[], Any] | None = None) -> list[str]:
+    """Ask a running OBS (through its WebSocket) for the names of its microphone inputs."""
+    if client_factory is None:
+        try:
+            import obsws_python as obs
+        except ImportError as e:
+            raise ObsLookupError("OBS control needs a package that isn't installed yet. "
+                                 "Run: pip install obsws-python") from e
+        client_factory = lambda: obs.ReqClient(host=host, port=port, password=password or "",  # noqa: E731
+                                               timeout=timeout)
+    try:
+        cl = client_factory()
+    except Exception as e:  # OBS closed, WebSocket off, wrong password...
+        words = str(e).lower()
+        if "auth" in words or "password" in words:
+            raise ObsLookupError("OBS rejected the password. Check that it matches the Server Password "
+                                 "in OBS (Tools > WebSocket Server Settings).") from e
+        raise ObsLookupError("Couldn't connect to OBS. Make sure OBS is open, 'Enable WebSocket server' is "
+                             "ticked, and the password above is right.") from e
+    try:
+        names: list[str] = []
+        for item in cl.get_input_list().inputs:
+            if "input_capture" in str(item.get("inputKind", "")):  # wasapi_input_capture = a microphone
+                names.append(str(item.get("inputName", "")))
+        special = cl.get_special_inputs()  # the "Mic/Aux" style global audio devices
+        for attr in ("mic1", "mic2", "mic3", "mic4"):
+            n = getattr(special, attr, None)
+            if n:
+                names.append(str(n))
+    except Exception as e:
+        raise ObsLookupError(f"OBS answered, but the microphone list couldn't be read ({type(e).__name__}).") from e
+    finally:
+        with contextlib.suppress(Exception):
+            cl.disconnect()
+    return list(dict.fromkeys(n for n in names if n))
 
 
 def list_windows_voices() -> list[str]:
@@ -606,7 +649,7 @@ class JarvisApp(ctk.CTk):
     _RESTART_LABELS = {
         "JARVIS_INPUT_DEVICE": "microphone", "JARVIS_VOICE": "Windows voice", "LLM_MODEL": "model",
         "ASSISTANT_NAME": "assistant name", "ELEVENLABS_API_KEY": "ElevenLabs key",
-        "ELEVENLABS_VOICE_ID": "ElevenLabs voice ID", "OBS_PASSWORD": "OBS password",
+        "ELEVENLABS_VOICE_ID": "ElevenLabs voice ID",
     }
 
     @staticmethod
@@ -628,6 +671,8 @@ class JarvisApp(ctk.CTk):
             "ELEVENLABS_API_KEY": get("ELEVENLABS_API_KEY", J.ELEVENLABS_API_KEY),
             "ELEVENLABS_VOICE_ID": get("ELEVENLABS_VOICE_ID", J.ELEVENLABS_VOICE_ID),
             "OBS_PASSWORD": get("OBS_PASSWORD", J.OBS_PASSWORD),
+            "OBS_MIC_INPUT": get("OBS_MIC_INPUT", J.OBS_MIC_INPUT),
+            "JARVIS_WAKE_SOUND_VOLUME": get("JARVIS_WAKE_SOUND_VOLUME", f"{J.WAKE_SOUND_VOLUME:g}"),
         }
 
     def _build_settings_tab(self, tab: ctk.CTkFrame) -> None:
@@ -673,6 +718,22 @@ class JarvisApp(ctk.CTk):
         field("Wake sound", sound_row, "Plays when it hears the wake word. Takes effect as soon as you pick it. "
                                        "Preview uses your current volume setting.")
 
+        try:
+            vol0 = max(0.0, min(1.0, float(cur["JARVIS_WAKE_SOUND_VOLUME"])))
+        except ValueError:
+            vol0 = J.WAKE_SOUND_VOLUME
+        vol_row = ctk.CTkFrame(sc, fg_color="transparent")
+        vol_row.columnconfigure(0, weight=1)
+        self.volume_slider = ctk.CTkSlider(vol_row, from_=0, to=1, number_of_steps=20,
+                                           command=self._volume_changed)
+        self.volume_slider.set(vol0)
+        self.volume_slider.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.volume_label = ctk.CTkLabel(vol_row, text=f"{round(vol0 * 100)}%", width=48, anchor="e")
+        self.volume_label.grid(row=0, column=1)
+        field("Wake sound volume", vol_row,
+              "How loud the wake sound is. It changes as you slide, so use Preview to hear it. "
+              "Press Save settings to keep it next time. 0% is silent.")
+
         header("Brain (LM Studio)")
         model_row = ctk.CTkFrame(sc, fg_color="transparent")
         model_row.columnconfigure(0, weight=1)
@@ -698,7 +759,17 @@ class JarvisApp(ctk.CTk):
         header("ElevenLabs voice (optional)")
         self.eleven_key = ctk.CTkEntry(sc, show="\u2022")
         self.eleven_key.insert(0, cur["ELEVENLABS_API_KEY"])
-        field("API key", self.eleven_key)
+        field("API key", self.eleven_key,
+              "When you create the key, turn on these permissions: Speech to Text, Text to Speech, "
+              "and Voices (Read). Otherwise ElevenLabs will refuse the key.")
+        links = ctk.CTkFrame(sc, fg_color="transparent")
+        links.grid(row=self._srow, column=1, sticky="w", pady=(0, 4))
+        self._srow += 1
+        for i, (text, url) in enumerate(self._ELEVEN_LINKS):
+            ctk.CTkButton(
+                links, text=text, width=0, height=22, fg_color="transparent", hover_color="#1f2937",
+                text_color="#93c5fd", font=ctk.CTkFont(size=12, underline=True),
+                command=lambda u=url: self.open_link(u)).grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
         self.eleven_voice = ctk.CTkEntry(sc)
         self.eleven_voice.insert(0, cur["ELEVENLABS_VOICE_ID"])
         field("Voice ID", self.eleven_voice, f"Free accounts need a default voice, e.g. George: {J.GEORGE_VOICE_ID}")
@@ -706,7 +777,36 @@ class JarvisApp(ctk.CTk):
         header("OBS Studio (optional)")
         self.obs_pw = ctk.CTkEntry(sc, show="\u2022")
         self.obs_pw.insert(0, cur["OBS_PASSWORD"])
-        field("WebSocket password", self.obs_pw)
+        field("WebSocket password", self.obs_pw,
+              "Only needed if you want Jarvis to control OBS (record, stream, scenes, mute your mic). "
+              "Otherwise leave it blank.")
+        # A small drop-down: click to show or hide the setup steps.
+        self.obs_help_btn = ctk.CTkButton(
+            sc, text=self._OBS_HELP_CLOSED, width=0, height=24, anchor="w", fg_color="transparent",
+            hover_color="#1f2937", text_color="#93c5fd", command=self._toggle_obs_help)
+        self.obs_help_btn.grid(row=self._srow, column=1, sticky="w", pady=(2, 0))
+        self._srow += 1
+        self.obs_help_text = ctk.CTkLabel(
+            sc, text=self._OBS_HELP_TEXT, text_color="#9ca3af", font=ctk.CTkFont(size=12),
+            wraplength=460, justify="left", anchor="w")
+        self.obs_help_text.grid(row=self._srow, column=1, sticky="w", pady=(2, 0))
+        self.obs_help_text.grid_remove()  # hidden until the drop-down is opened
+        self._srow += 1
+
+        obs_mic_row = ctk.CTkFrame(sc, fg_color="transparent")
+        obs_mic_row.columnconfigure(0, weight=1)
+        self.obs_mic_combo = ctk.CTkComboBox(obs_mic_row, values=[cur["OBS_MIC_INPUT"]])
+        self.obs_mic_combo.set(cur["OBS_MIC_INPUT"])
+        self.obs_mic_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.obs_find_btn = ctk.CTkButton(obs_mic_row, text="Find in OBS", width=100, command=self.find_obs_mic)
+        self.obs_find_btn.grid(row=0, column=1)
+        field("Mic name in OBS", obs_mic_row,
+              "Used by 'mute my mic'. Open OBS, enter the password above, then click Find in OBS and pick yours. "
+              "The default, Mic/Aux, is right for most people.")
+        self.obs_status = ctk.CTkLabel(sc, text="", text_color="#9ca3af", font=ctk.CTkFont(size=12),
+                                       wraplength=460, justify="left")
+        self.obs_status.grid(row=self._srow, column=1, sticky="w")
+        self._srow += 1
 
         self.show_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(sc, text="Show keys and passwords", variable=self.show_var,
@@ -723,6 +823,78 @@ class JarvisApp(ctk.CTk):
         threading.Thread(target=lambda: self.post(self._apply_mics, J.list_input_devices()), daemon=True).start()
         threading.Thread(target=lambda: self.post(self._apply_voices, list_windows_voices()), daemon=True).start()
         self.refresh_models()
+
+    _ELEVEN_LINKS = (
+        ("Log in", "https://elevenlabs.io/app/sign-in"),
+        ("Create an account", "https://elevenlabs.io/sign-up"),
+        ("Get an API key", "https://elevenlabs.io/app/settings/api-keys"),
+    )
+
+    def open_link(self, url: str) -> None:
+        """Open a web page in the user's normal browser."""
+        try:
+            webbrowser.open(url)
+        except Exception as e:  # never let a link click crash the app
+            messagebox.showinfo("Open link", f"Couldn't open your browser. Please visit:\n{url}\n\n({e})")
+
+    _OBS_HELP_CLOSED = "How to set this up  \u25B8"
+    _OBS_HELP_OPEN = "How to set this up  \u25BE"
+    _OBS_HELP_TEXT = (
+        "1. In OBS, open Tools > WebSocket Server Settings.\n"
+        "2. Tick 'Enable WebSocket server' (leave the port at 4455).\n"
+        "3. Keep 'Enable Authentication' on, click 'Show Connect Info' and copy the Server Password.\n"
+        "4. Paste it above and press Save settings (no restart needed).\n"
+        "5. Click 'Find in OBS' below and pick your microphone, so 'mute my mic' works.\n\n"
+        "If you turn authentication off in OBS, leave the password box blank. This is not an account "
+        "login: it only protects the link between OBS and Jarvis on your own PC.")
+
+    def find_obs_mic(self) -> None:
+        """'Find in OBS' button: connect to OBS, list its microphones, let the user pick one."""
+        password = self.obs_pw.get().strip()  # read here: tk widgets belong to the main thread
+        self.obs_find_btn.configure(state="disabled")
+        self.obs_status.configure(text="Asking OBS...", text_color="#9ca3af")
+
+        def run() -> None:
+            try:
+                result: Any = find_obs_mics(J.OBS_HOST, J.OBS_PORT, password)
+            except ObsLookupError as e:
+                result = e
+            except Exception as e:  # never leave the button stuck
+                record_crash("OBS mic lookup failed")
+                result = ObsLookupError(f"Something went wrong: {type(e).__name__}: {e}")
+            self.post(self._apply_obs_mics, result)
+
+        threading.Thread(target=run, daemon=True, name="obs-lookup").start()
+
+    def _apply_obs_mics(self, result: Any) -> None:
+        self.obs_find_btn.configure(state="normal")
+        if isinstance(result, Exception):
+            self.obs_status.configure(text=str(result), text_color="#f87171")
+            return
+        names: list[str] = result
+        if not names:
+            self.obs_status.configure(
+                text="Connected to OBS, but it has no microphone inputs. Add one in OBS's Audio Mixer, "
+                     "then try again.", text_color="#fbbf24")
+            return
+        current = self.obs_mic_combo.get().strip()
+        self.obs_mic_combo.configure(values=names)
+        if len(names) == 1 or current not in names:
+            self.obs_mic_combo.set(names[0])  # a good starting point; the list lets them change it
+        if len(names) == 1:
+            text = f"Found your mic: {names[0]}. Press Save settings to keep it."
+        else:
+            text = (f"Found {len(names)} microphones in OBS. Pick yours from the list, "
+                    "then press Save settings.")
+        self.obs_status.configure(text=text, text_color="#86efac")
+
+    def _toggle_obs_help(self) -> None:
+        if self.obs_help_text.grid_info():  # non-empty = currently shown
+            self.obs_help_text.grid_remove()
+            self.obs_help_btn.configure(text=self._OBS_HELP_CLOSED)
+        else:
+            self.obs_help_text.grid()
+            self.obs_help_btn.configure(text=self._OBS_HELP_OPEN)
 
     def _toggle_secrets(self) -> None:
         mask = "" if self.show_var.get() else "\u2022"
@@ -796,6 +968,12 @@ class JarvisApp(ctk.CTk):
             text=f"Wake sound is now {label}. (Press Save too if you want it written to .env as well.)",
             text_color="#86efac")
 
+    def _volume_changed(self, value: float) -> None:
+        """Volume slider moved: use it right now (Preview and the real wake sound both follow it)."""
+        v = round(float(value), 2)
+        J.WAKE_SOUND_VOLUME = v
+        self.volume_label.configure(text=f"{round(v * 100)}%")
+
     def preview_sound(self) -> None:
         if self._preview_busy:
             return
@@ -832,6 +1010,8 @@ class JarvisApp(ctk.CTk):
             "ELEVENLABS_API_KEY": self.eleven_key.get().strip(),
             "ELEVENLABS_VOICE_ID": self.eleven_voice.get().strip(),
             "OBS_PASSWORD": self.obs_pw.get().strip(),
+            "OBS_MIC_INPUT": self.obs_mic_combo.get().strip() or "Mic/Aux",
+            "JARVIS_WAKE_SOUND_VOLUME": f"{round(float(self.volume_slider.get()), 2):g}",
         }
         initial = getattr(self, "_voice_initial", None)
         if initial and voice_label == initial[0]:
@@ -845,12 +1025,20 @@ class JarvisApp(ctk.CTk):
             return
         # Apply live (no restart): the wake sound (saved above) and what it calls you.
         applied = ["wake sound"]
+        if updates["JARVIS_WAKE_SOUND_VOLUME"] != self._cur["JARVIS_WAKE_SOUND_VOLUME"]:
+            J.WAKE_SOUND_VOLUME = float(updates["JARVIS_WAKE_SOUND_VOLUME"])  # already live; keep it in sync
+            applied.append("wake sound volume")
         if updates["USER_TITLE"] != J.USER_TITLE:
             J.set_user_title(updates["USER_TITLE"])
             if self.brain is not None:
                 with self.brain._ask_lock:
                     self.brain.history.clear()  # old replies that said "sir" would keep nudging the model
             applied.append("what it calls you")
+        # OBS password and mic name are read each time an OBS command runs, so they apply live too.
+        if updates["OBS_PASSWORD"] != J.OBS_PASSWORD or updates["OBS_MIC_INPUT"] != J.OBS_MIC_INPUT:
+            J.OBS_PASSWORD = updates["OBS_PASSWORD"]
+            J.OBS_MIC_INPUT = updates["OBS_MIC_INPUT"]
+            applied.append("OBS settings")
         # Everything else is read once at start-up, so it needs a restart.
         needs_restart = [label for key, label in self._RESTART_LABELS.items()
                          if updates[key] != self._cur[key]]

@@ -150,15 +150,19 @@ Use **either** the console version **or** the desktop app, not both at once (the
 **Settings tab**
 - Dropdowns: **microphone** (from sounddevice), **Windows voice** (installed voices), **wake sound** (with a **Preview**
   button) and **LM Studio model** (from `/v1/models`; press **Refresh** after starting LM Studio, or type a name).
-- Fields: assistant name, what it calls you, ElevenLabs key (hidden) and voice ID, OBS password (hidden).
-  Tick "Show keys and passwords" to see them.
+- **Wake sound volume** slider (0-100%, default 30%). It changes as you slide, so use **Preview** to hear it; press
+  Save to keep it (`JARVIS_WAKE_SOUND_VOLUME`).
+- Fields: assistant name, what it calls you, ElevenLabs key (hidden) and voice ID, OBS password (hidden) and OBS mic
+  name. Tick "Show keys and passwords" to see them. Under the OBS password there is a **How to set this up** drop-down
+  with the steps, and a **Find in OBS** button: with OBS open, it lists your OBS microphones so you can pick yours
+  (no need to edit any files).
 - **Save settings** copies your current `.env` to `.env.bak`, then writes the new values. Settings you didn't touch
   (thresholds, Whisper model, and so on) are kept as they are.
 - **Applied immediately, no restart:** the **wake sound** (as soon as you pick it in the dropdown; it's stored in
-  `.cache/settings.json`, which overrides `.env`) and **what it calls you** (when you press Save; the chat history is
-  cleared so earlier replies don't keep using the old title).
+  `.cache/settings.json`, which overrides `.env`), **what it calls you** (when you press Save; the chat history is
+  cleared so earlier replies don't keep using the old title) and the **OBS password and mic name** (when you press Save).
 - **Need a restart** (the Save message lists which ones you changed): microphone, Windows voice, model, assistant
-  name, ElevenLabs key/voice ID and OBS password. Use the tray icon > **Quit**, then start the app again.
+  name and ElevenLabs key/voice ID. Use the tray icon > **Quit**, then start the app again.
 - Microphone numbers can change when devices are plugged in or out (virtual mics like Voicemod re-number them).
   If your mic stops working, re-pick it here and save.
 
@@ -186,6 +190,8 @@ Setup:
 3. Paste it into `.env` as `OBS_PASSWORD=...`. If authentication is off, leave it blank.
 4. Set `OBS_MIC_INPUT` to your mic's name in the OBS Audio Mixer. The default is `Mic/Aux`.
 
+(In the desktop app you can do steps 3 and 4 in the Settings tab instead: paste the password, then click **Find in OBS**.)
+
 Things to say: "start recording", "stop recording", "go live" / "start streaming", "stop streaming",
 "switch to scene gameplay", "list scenes", "mute my mic" / "unmute my mic", "clip that" / "save replay"
 (the Replay Buffer must be started in OBS), and "am I live?" / "am I recording?".
@@ -197,7 +203,9 @@ If OBS isn't running or WebSocket is off, Jarvis tells you so instead of failing
 - Wake word too sensitive / deaf → tune `JARVIS_WAKE_THRESHOLD` (0.3–0.7).
 - It interrupts itself → raise `JARVIS_BARGE_IN_THRESHOLD` (e.g. 0.85), use headphones, or set `JARVIS_BARGE_IN=0`.
 - Transcription slow → `WHISPER_MODEL=base` (or `tiny`).
+- Feels slow after you finish talking → lower `JARVIS_SILENCE_SECONDS` (default `0.75`). Raise it (e.g. `1.2`) if it cuts you off mid-sentence.
 - Recording never stops in a noisy room → raise `JARVIS_VAD_RMS`.
+- ElevenLabs speech starts as soon as the first audio arrives (streamed), instead of waiting for the whole reply.
 - openwakeword needs `onnxruntime` on Windows (included in requirements.txt; tflite isn't available there).
 - CUDA Whisper needs cuBLAS 12 / cuDNN 9 (e.g. `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` and add their `bin` dirs to PATH).
   A 1 s warm-up at load detects missing DLLs and falls back to CPU int8; a CUDA error during transcription also
@@ -227,7 +235,7 @@ The console prompt and the pause message use a friendly name taken from the mode
 To get a wake word like "Hey Friday", you need to train a custom model. The openWakeWord project has a notebook for training custom models, linked in its README: https://github.com/dscripka/openWakeWord
 
 ## Choosing a wake sound
-There are 32 built-in wake sounds plus `random` (a different one each wake). Pick one any of these ways:
+There are 39 built-in wake sounds plus `random` (a different one each wake). Pick one any of these ways:
 
 - **By voice** (instant, no LLM needed):
   - "Change your sound to piano", "set the wake sound to steel drum", "switch the sound to music box"
@@ -242,13 +250,18 @@ A choice made by voice or `--sounds` is saved in `.cache/settings.json` (`"wake_
 
 | Category | Sounds |
 |---|---|
-| Classic | `bell` (Bell), `chime3` (Three-note chime), `droplet` (Water droplet), `beep` (Two-tone beep) |
+| Classic | `bell` (Bell), `chime3` (Three-note chime), `beep` (Two-tone beep) |
 | Space | `warp` (Warp), `comms` (Starship comms), `cosmos` (Cosmos), `sonar` (Sonar ping), `blip` (Sci-fi blip) |
 | Instruments | `piano` (Piano), `acoustic_guitar` (Acoustic guitar), `harp` (Harp), `violin` (Violin), `cello` (Cello), `trumpet` (Trumpet), `sax` (Saxophone), `flute` (Flute), `clarinet` (Clarinet), `marimba` (Marimba), `xylophone` (Xylophone), `vibraphone` (Vibraphone), `steel_drum` (Steel drum), `kalimba` (Kalimba), `music_box` (Music box), `banjo` (Banjo), `sitar` (Sitar), `synth_lead` (Synth lead), `organ` (Organ), `taiko` (Taiko drum) |
 | Fun | `chug` (Metal palm-mute chug), `powerup` (Power-up), `chirp` (Bird chirp) |
+| Radio | `radio_click` (Radio click, push-to-talk), `roger_beep` (Roger beep, the "over" beep), `talkabout` (Walkie talkie call tone), `police_radio` (Police radio chirp), `cb_radio` (CB radio kerchunk), `ham_radio` (Ham radio courtesy tone), `military_radio` (Military radio double click), `squelch_tail` (Squelch tail, "over and out") |
 | Other | `random` (a different one each wake) |
 
+The radio sounds are made up by the program in the style of each kind of handheld radio; they are not recordings of real radios.
+
+**Can't hear a short sound?** Some USB and Bluetooth headphones swallow the first moment of any new sound while they wake up, so very short sounds (like `beep` or `blip`) can vanish. Jarvis plays a short silent lead-in first (`JARVIS_WAKE_SOUND_PREROLL`, default `0.2` seconds). Raise it (for example `0.4`) if a sound still seems missing, or set `0` to turn it off.
+
 ## Wake sound and quiet song controls
-- `JARVIS_WAKE_SOUND_STYLE` picks the wake sound: `bell` (default), `warp`, `comms`, `cosmos` (space sounds), `chug` (metal palm-mute), `chime3`, `droplet`, `sonar`, `powerup`, `chirp`, `blip`, or `beep`; or an instrument: `piano`, `acoustic_guitar`, `harp`, `violin`, `cello`, `trumpet`, `sax`, `flute`, `clarinet`, `marimba`, `xylophone`, `vibraphone`, `steel_drum`, `kalimba`, `music_box`, `banjo`, `sitar`, `synth_lead`, `organ`, `taiko`, or `random`. See [Choosing a wake sound](#choosing-a-wake-sound).
+- `JARVIS_WAKE_SOUND_STYLE` picks the wake sound: `bell` (default), `warp`, `comms`, `cosmos` (space sounds), `chug` (metal palm-mute), `chime3`, `sonar`, `powerup`, `chirp`, `blip`, or `beep`; or an instrument: `piano`, `acoustic_guitar`, `harp`, `violin`, `cello`, `trumpet`, `sax`, `flute`, `clarinet`, `marimba`, `xylophone`, `vibraphone`, `steel_drum`, `kalimba`, `music_box`, `banjo`, `sitar`, `synth_lead`, `organ`, `taiko`; a radio: `radio_click`, `roger_beep`, `talkabout`, `police_radio`, `cb_radio`, `ham_radio`, `military_radio`, `squelch_tail`; or `random`. See [Choosing a wake sound](#choosing-a-wake-sound).
 - `JARVIS_WAKE_SOUND_FILE` plays your own short `.wav` instead (up to 3 seconds).
 - Song commands like "next song", "skip this track", "previous song", and "pause the music" run instantly and silently. Set `JARVIS_QUIET_MEDIA=0` if you want him to confirm out loud.
