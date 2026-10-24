@@ -1,0 +1,10 @@
+python-dotenv
+numpy
+sounddevice
+elevenlabs
+openwakeword
+faster-whisper
+openai
+pyttsx3
+onnxruntime
+obsws-python
