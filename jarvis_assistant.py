@@ -142,15 +142,19 @@ FOLLOWUP_END_PHRASES = [
 PAUSE_PHRASES = [p.strip().lower() for p in _env(
     "JARVIS_PAUSE_PHRASES", "stop listening,go to sleep,mute yourself,pause listening").split(",")
     if p.strip()]
-PAUSE_REPLY = T(f"Going quiet, {{t}}. Say {WAKE_PHRASE} when you need me.")
-RESUME_REPLY = T("At your service, {t}.")
+_PAUSE_REPLY_TEMPLATE = f"Going quiet, {{t}}. Say {WAKE_PHRASE} when you need me."
+_RESUME_REPLY_TEMPLATE = "At your service, {t}."
+PAUSE_REPLY = T(_PAUSE_REPLY_TEMPLATE)
+RESUME_REPLY = T(_RESUME_REPLY_TEMPLATE)
 
 ELEVENLABS_API_KEY = _env("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID = _env("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 ELEVENLABS_OUTPUT_FORMAT = _env("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000")
 
-SYSTEM_PROMPT = (
+def build_system_prompt() -> str:
+    """The model's instructions. A function so the title can be changed while running (set_user_title)."""
+    return (
     f"You are {ASSISTANT_NAME}, a witty, polite British AI butler. Your replies are spoken aloud, "
     "so answer in 1-3 short sentences of plain conversational English. Never use "
     "markdown, lists, code blocks, emojis or URLs read character by character. "
@@ -164,7 +168,10 @@ SYSTEM_PROMPT = (
     "streaming when the user clearly asked to go live. "
     "Do not end replies with offers like 'What would you like me to do?' or 'How can I "
     "assist you further?'; a closing line is added for you."
-)
+    )
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 _DEFAULT_CLOSINGS = (
     "Let me know if you need anything else.|Anything else I can do for you?|"
@@ -373,7 +380,8 @@ APP_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "app_index.json"
 APP_CACHE_MAX_AGE = 24 * 3600
 SETTINGS_PATH = APP_CACHE_PATH.parent / "settings.json"
 CONSENT_QUESTION = f"{ASSISTANT_NAME} here. Would you like me to scan your PC so I can open your apps for you?"
-CONSENT_DECLINED = T("No problem, {t}. Say scan my apps any time.")
+_CONSENT_DECLINED_TEMPLATE = "No problem, {t}. Say scan my apps any time."
+CONSENT_DECLINED = T(_CONSENT_DECLINED_TEMPLATE)
 
 
 # --- opt-in consent (stored in .cache/settings.json: app_scan_consent true/false/null) ---
@@ -1154,8 +1162,9 @@ OBS_PORT = int(_env_float("OBS_PORT", 4455))
 OBS_PASSWORD = _env("OBS_PASSWORD")
 OBS_MIC_INPUT = _env("OBS_MIC_INPUT", "Mic/Aux")
 OBS_TIMEOUT = _env_float("OBS_TIMEOUT", 3.0)
-OBS_UNAVAILABLE = T("I can't reach OBS, {t}. Make sure OBS is running and the WebSocket server is on, "
-                    "under Tools, WebSocket Server Settings.")
+_OBS_UNAVAILABLE_TEMPLATE = ("I can't reach OBS, {t}. Make sure OBS is running and the WebSocket server is on, "
+                             "under Tools, WebSocket Server Settings.")
+OBS_UNAVAILABLE = T(_OBS_UNAVAILABLE_TEMPLATE)
 _GO_LIVE_RE = re.compile(r"\b(go(ing)? live|start(ing)? (the |my )?stream(ing)?|begin (the |my )?stream"
                          r"|stream now|start broadcasting)\b", re.I)
 
@@ -2462,6 +2471,18 @@ def run_setup_wizard(ask: Callable[[str], str] = input, sd: Any = None, opener: 
         out(f"\nBacked up the old settings to {backup.name}.")
     out(f"Saved {env_path}. Run: python {Path(__file__).name}")
     return vals
+
+
+def set_user_title(title: str) -> None:
+    """Change what the assistant calls the user while it is running (used by the desktop app).
+    Blank = no title. Rebuilds the few texts that were filled in once at start-up."""
+    global USER_TITLE, SYSTEM_PROMPT, PAUSE_REPLY, RESUME_REPLY, CONSENT_DECLINED, OBS_UNAVAILABLE
+    USER_TITLE = (title or "").strip()
+    SYSTEM_PROMPT = build_system_prompt()
+    PAUSE_REPLY = T(_PAUSE_REPLY_TEMPLATE)
+    RESUME_REPLY = T(_RESUME_REPLY_TEMPLATE)
+    CONSENT_DECLINED = T(_CONSENT_DECLINED_TEMPLATE)
+    OBS_UNAVAILABLE = T(_OBS_UNAVAILABLE_TEMPLATE)
 
 
 # ---------------------------------------------------------------------------

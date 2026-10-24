@@ -127,6 +127,52 @@ Pressing **p** in the console window toggles pause/resume too (Windows only).
 Check LM Studio's settings for options to start at login and to start the local server automatically,
 and turn them on. If Jarvis starts first, it will say it can't reach LM Studio until the server is up. No restart is needed.
 
+## Desktop app
+`jarvis_gui.py` is a dark-themed window around the same assistant (built with CustomTkinter). The console version
+(`jarvis_assistant.py`) is unchanged and still works exactly as before.
+
+```
+pip install -r requirements.txt       # adds customtkinter, pystray and pillow
+python jarvis_gui.py                  # or double-click start_jarvis_gui.bat (no console window)
+```
+Use **either** the console version **or** the desktop app, not both at once (they would both answer you).
+
+**Assistant tab**
+- A big status box: **Listening** (green), **Thinking** (amber), **Speaking** (blue) or **Paused** (grey). It also shows
+  **Stopped** and **Starting...** (the first start loads Whisper, which can take a while).
+- **Start** begins the voice loop (say the wake word as usual), **Pause** / **Resume** works like saying "stop listening"
+  (saying the wake word also resumes), and **Stop** ends the loop. Starting again afterwards is instant.
+- The chat log shows what you said and what Jarvis replied, plus warnings (for example if Whisper falls back to CPU).
+- Type in the box and press Enter to make a request without speaking. Untick "Speak replies out loud" for text-only
+  answers. This works even before you press Start.
+- The first time, a Yes/No pop-up asks about the opt-in app scan (see "Opening apps").
+
+**Settings tab**
+- Dropdowns: **microphone** (from sounddevice), **Windows voice** (installed voices), **wake sound** (with a **Preview**
+  button) and **LM Studio model** (from `/v1/models`; press **Refresh** after starting LM Studio, or type a name).
+- Fields: assistant name, what it calls you, ElevenLabs key (hidden) and voice ID, OBS password (hidden).
+  Tick "Show keys and passwords" to see them.
+- **Save settings** copies your current `.env` to `.env.bak`, then writes the new values. Settings you didn't touch
+  (thresholds, Whisper model, and so on) are kept as they are.
+- **Applied immediately, no restart:** the **wake sound** (as soon as you pick it in the dropdown; it's stored in
+  `.cache/settings.json`, which overrides `.env`) and **what it calls you** (when you press Save; the chat history is
+  cleared so earlier replies don't keep using the old title).
+- **Need a restart** (the Save message lists which ones you changed): microphone, Windows voice, model, assistant
+  name, ElevenLabs key/voice ID and OBS password. Use the tray icon > **Quit**, then start the app again.
+- Microphone numbers can change when devices are plugged in or out (virtual mics like Voicemod re-number them).
+  If your mic stops working, re-pick it here and save.
+
+**System tray**
+- Closing the window (the X) hides it to the tray; Jarvis keeps running. The icon changes colour with the status.
+- Left-click the icon, or right-click > **Show**, to bring the window back. Right-click also has **Pause** / **Resume**
+  and **Quit**. Use **Quit** to really exit.
+
+**Troubleshooting the app**
+- `start_jarvis_gui.bat` hides the console. To see errors, run `python jarvis_gui.py` in a terminal. Crashes are also
+  written to `jarvis_gui.log` in this folder.
+- Everything the app does runs in a background thread; the window only updates through a queue polled with `after()`,
+  so it never freezes while Jarvis is thinking or speaking.
+
 ## Game-mode tip
 While gaming, free the GPU: load **Qwen3 1.7B** in LM Studio with GPU offload set to 0 (CPU only),
 set `LLM_MODEL=qwen3-1.7b`, and `WHISPER_DEVICE=cpu`, `WHISPER_MODEL=tiny` or `base`.

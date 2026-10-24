@@ -8,3 +8,6 @@ openai
 pyttsx3
 onnxruntime
 obsws-python
+customtkinter
+pystray
+pillow
