@@ -158,7 +158,8 @@ PAUSE_REPLY = T(_PAUSE_REPLY_TEMPLATE)
 RESUME_REPLY = T(_RESUME_REPLY_TEMPLATE)
 
 ELEVENLABS_API_KEY = _env("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID")
+GEORGE_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # ElevenLabs default (premade) voice, works on the free plan
+ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID", GEORGE_VOICE_ID)  # blank -> George
 ELEVENLABS_MODEL_ID = _env("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 ELEVENLABS_OUTPUT_FORMAT = _env("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000")
 
@@ -357,7 +358,7 @@ class Speaker:
             buf = bytearray()
 
             def flush(force: bool = False) -> None:
-                nonlocal buf, stream, got_any
+                nonlocal stream, got_any
                 n = len(buf) - (len(buf) % 2)  # int16 frames need an even byte count
                 if n == 0:
                     return
@@ -2070,7 +2071,6 @@ class Ears:
         frames, silent, heard = [], 0.0, False
         speech_start = 0.0
         frame_s = FRAME_SAMPLES / SAMPLE_RATE
-        start = time.time()
         with self._stream() as s:
             while True:
                 if heard and time.time() - speech_start >= MAX_RECORD_SECONDS:
@@ -2678,7 +2678,6 @@ def followup_chime() -> None:
 # First-run setup wizard (python jarvis_assistant.py --setup)
 # ---------------------------------------------------------------------------
 
-GEORGE_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
 
 def mask_secret(v: str) -> str:

@@ -1,9 +1,10 @@
 @echo off
 rem Puts a "Jarvis" shortcut on your Desktop that opens the Jarvis app (no black console window).
 rem Safe to run again: it just replaces the shortcut. No admin rights, nothing is downloaded.
-cd /d "%~dp0"
-set "JV_DIR=%~dp0"
-set "JV_DIR=%JV_DIR:~0,-1%"
+rem This script lives in tools\; the Jarvis folder is one level up.
+for %%I in ("%~dp0..") do set "APP_DIR=%%~fI"
+cd /d "%APP_DIR%"
+set "JV_DIR=%APP_DIR%"
 
 rem Find pythonw.exe (Python without a console window): this folder's .venv first,
 rem then the one next to python.exe, then anything "where pythonw" finds.

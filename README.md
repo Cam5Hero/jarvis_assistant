@@ -1,6 +1,10 @@
 # Jarvis Assistant (v1 – "ask Jarvis anything")
 
+**Start here: double-click `setup.bat`** (see [SETUP_GUIDE.md](SETUP_GUIDE.md)). Extra scripts are in `tools/` (see `tools/README.txt`).
+
 Wake word "hey Jarvis" → speak → local Whisper transcribes → local LLM (LM Studio) answers / runs a skill → Jarvis speaks back.
+
+**New here / not a coder?** Follow the simple [Setup guide](SETUP_GUIDE.md): install Python, download the ZIP, double-click `setup.bat`.
 
 ## Features
 - Wake word ("hey Jarvis") with a short two-tone chime, then local Whisper speech-to-text (`small` model by default)
@@ -117,11 +121,11 @@ and goes straight into listening for your request.
 Pressing **p** in the console window toggles pause/resume too (Windows only).
 
 ## Start with Windows
-- `start_jarvis.bat` starts Jarvis in a minimized console window titled **Jarvis**. Restore it from the
+- `tools\start_jarvis.bat` starts Jarvis in a minimized console window titled **Jarvis**. Restore it from the
   taskbar to see logs or errors, or to press **p** (pause/resume). It uses `.venv` in this folder if there is one.
-- `install_startup.bat` adds a `Jarvis.lnk` shortcut to your Startup folder
+- `tools\install_startup.bat` adds a `Jarvis.lnk` shortcut (it runs `run_jarvis.bat`, the desktop app) to your Startup folder
   (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`), so Jarvis starts when you log in. No admin needed.
-- `remove_startup.bat` removes that shortcut.
+- `tools\remove_startup.bat` removes that shortcut.
 
 **LM Studio has to be running too.** Jarvis needs LM Studio's local server running, with the model loaded, before it can answer.
 Check LM Studio's settings for options to start at login and to start the local server automatically,
@@ -133,7 +137,7 @@ and turn them on. If Jarvis starts first, it will say it can't reach LM Studio u
 
 ```
 pip install -r requirements.txt       # adds customtkinter, pystray and pillow
-python jarvis_gui.py                  # or double-click start_jarvis_gui.bat (no console window)
+python jarvis_gui.py                  # or double-click run_jarvis.bat (no console window)
 ```
 Use **either** the console version **or** the desktop app, not both at once (they would both answer you).
 
@@ -175,7 +179,7 @@ Use **either** the console version **or** the desktop app, not both at once (the
   and **Quit**. Use **Quit** to really exit.
 
 **Troubleshooting the app**
-- `start_jarvis_gui.bat` hides the console. To see errors, run `python jarvis_gui.py` in a terminal. Crashes are also
+- `run_jarvis.bat` hides the console. To see errors, run `python jarvis_gui.py` in a terminal. Crashes are also
   written to `jarvis_gui.log` in this folder.
 - Everything the app does runs in a background thread; the window only updates through a queue polled with `after()`,
   so it never freezes while Jarvis is thinking or speaking.
@@ -198,7 +202,7 @@ The switch/voice choice is remembered in `.cache/settings.json` and overrides `.
 For the language model itself, see the tip above (LM Studio GPU offload).
 
 ## Desktop shortcut
-Double-click **`create_desktop_shortcut.bat`** (or press **Create desktop shortcut** in Settings). It puts a
+Double-click **`tools\create_desktop_shortcut.bat`** (or press **Create desktop shortcut** in Settings). It puts a
 **Jarvis** icon on your Desktop (also works with a OneDrive Desktop) that opens the app with no black console window.
 No admin rights needed and nothing is downloaded. Run it again any time, e.g. after moving the folder.
 The icon is `jarvis.ico` (redraw it with `python make_icon.py`).

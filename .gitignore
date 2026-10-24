@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 venv/
 jarvis_gui.log
+kokoro_install.log
+setup.log

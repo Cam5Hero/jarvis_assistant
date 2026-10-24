@@ -1,7 +1,7 @@
 """
 Jarvis desktop app: a CustomTkinter (dark) window around jarvis_assistant.py.
 
-Run it with:   python jarvis_gui.py      (or double-click start_jarvis_gui.bat)
+Run it with:   python jarvis_gui.py      (or double-click run_jarvis.bat)
 
 How it fits together (the short version):
   * jarvis_assistant.py is NOT changed. This file imports it and reuses its Ears (mic + Whisper),
@@ -354,7 +354,7 @@ def find_pythonw() -> str:
 
 
 def shortcut_command() -> list[str]:
-    """Same PowerShell as create_desktop_shortcut.bat: WScript.Shell makes Desktop\\Jarvis.lnk.
+    """Same PowerShell as tools\\create_desktop_shortcut.bat: WScript.Shell makes Desktop\\Jarvis.lnk.
     Paths go in via environment variables (JV_PYW, JV_DIR) so no quoting tricks are needed."""
     ps = ("$lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Jarvis.lnk'; "
           "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk); "
@@ -538,6 +538,8 @@ class JarvisApp(ctk.CTk):
         if os.name == "nt" and ICON_PATH.exists():
             try:
                 self.iconbitmap(str(ICON_PATH))  # window + taskbar icon
+                # CustomTkinter sets its own icon about 200 ms after start; put ours back after that.
+                self.after(250, lambda: self.iconbitmap(str(ICON_PATH)))
             except Exception:
                 pass
         self.geometry("840x720")
@@ -546,6 +548,7 @@ class JarvisApp(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=12, pady=12)
         self._build_main_tab(self.tabs.add("Assistant"))
         self._build_settings_tab(self.tabs.add("Settings"))
+        self._build_howto_tab(self.tabs.add("How To"))
 
         handler = _ChatLogHandler(self)
         J.log.addHandler(handler)
@@ -829,7 +832,7 @@ class JarvisApp(ctk.CTk):
             "ASSISTANT_NAME": get("ASSISTANT_NAME", J.ASSISTANT_NAME),
             "USER_TITLE": get("USER_TITLE", J.USER_TITLE),
             "ELEVENLABS_API_KEY": get("ELEVENLABS_API_KEY", J.ELEVENLABS_API_KEY),
-            "ELEVENLABS_VOICE_ID": get("ELEVENLABS_VOICE_ID", J.ELEVENLABS_VOICE_ID),
+            "ELEVENLABS_VOICE_ID": get("ELEVENLABS_VOICE_ID", J.ELEVENLABS_VOICE_ID) or J.GEORGE_VOICE_ID,
             "OBS_PASSWORD": get("OBS_PASSWORD", J.OBS_PASSWORD),
             "OBS_MIC_INPUT": get("OBS_MIC_INPUT", J.OBS_MIC_INPUT),
             "JARVIS_WAKE_SOUND_VOLUME": get("JARVIS_WAKE_SOUND_VOLUME", f"{J.WAKE_SOUND_VOLUME:g}"),
@@ -910,22 +913,41 @@ class JarvisApp(ctk.CTk):
         field("Windows voice", self.voice_menu, "Used when ElevenLabs isn't set up (or fails).",
               key="JARVIS_VOICE", get=self._voice_value)
 
+        kokoro_ok = J.kokoro_installed()  # find_spec only, nothing heavy is imported
+        # Without Kokoro, don't offer it as an engine. A saved "kokoro" shows as Automatic (.env is untouched).
+        engine_labels = [k for k, v in self._ENGINE_LABELS.items() if kokoro_ok or v != "kokoro"]
         eng_cur = (cur["JARVIS_TTS_ENGINE"] or "").strip().lower()
-        eng_label = next((k for k, v in self._ENGINE_LABELS.items() if v == eng_cur), "Automatic")
-        self.engine_menu = ctk.CTkOptionMenu(sc, values=list(self._ENGINE_LABELS), dynamic_resizing=False)
+        eng_label = next((k for k in engine_labels if self._ENGINE_LABELS[k] == eng_cur), "Automatic")
+        self.engine_menu = ctk.CTkOptionMenu(sc, values=engine_labels, dynamic_resizing=False)
         self.engine_menu.set(eng_label)
-        kok_note = "" if J.kokoro_installed() else " Kokoro isn't installed yet (see the README)."
-        field("Voice engine", self.engine_menu,
-              "Automatic = ElevenLabs if you have a key, else Kokoro if installed, else the Windows voice. "
-              "If one fails it falls back to the next." + kok_note, key="JARVIS_TTS_ENGINE",
+        if not kokoro_ok and eng_cur == "kokoro":
+            self._saved["JARVIS_TTS_ENGINE"] = ""  # matches what's shown, so Apply isn't flagged as unsaved
+        if kokoro_ok:
+            eng_hint = ("Automatic = ElevenLabs if you have a key, else Kokoro, else the Windows voice. "
+                        "If one fails it falls back to the next.")
+        else:
+            eng_hint = ("Uses ElevenLabs if you have a key, else the Windows voice. "
+                        "Install Kokoro below for a free offline voice.")
+        field("Voice engine", self.engine_menu, eng_hint, key="JARVIS_TTS_ENGINE",
               get=lambda: self._ENGINE_LABELS.get(self.engine_menu.get(), ""))
+        # Install button, only when Kokoro is missing.
+        self.kokoro_install_row = None
+        if not kokoro_ok:
+            self.kokoro_install_row = ctk.CTkFrame(sc, fg_color="transparent")
+            self.kokoro_install_btn = ctk.CTkButton(self.kokoro_install_row, text="Install Kokoro voice", width=200,
+                                                    command=self.install_kokoro)
+            self.kokoro_install_btn.grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(self.kokoro_install_row, text="Free offline voice. Big download (about 1-2 GB). "
+                         "Jarvis will need a restart.", text_color="#9ca3af", font=ctk.CTkFont(size=12),
+                         wraplength=440, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
+            self.kokoro_install_row.grid(row=self._srow, column=1, sticky="w", pady=(0, 6))
+            self._srow += 1
 
         kokoro_row = ctk.CTkFrame(sc, fg_color="transparent")
         kokoro_row.columnconfigure(0, weight=1)
         kv = cur["KOKORO_VOICE"].strip() or "bm_george"
         def _klabel(code: str) -> str:
             nm = code.split("_", 1)[-1].capitalize()
-            kind = {"bm": "British man", "bf": "British woman", "am": "American man", "af": "American woman"}.get(code[:2], code)
             return nm
         self._kokoro_map = {_klabel(c): c for c in J.KOKORO_VOICES + ([kv] if kv not in J.KOKORO_VOICES else [])}
         self.kokoro_menu = ctk.CTkOptionMenu(
@@ -936,10 +958,12 @@ class JarvisApp(ctk.CTk):
         self.kokoro_preview_btn = ctk.CTkButton(kokoro_row, text="Preview", width=90,
                                                 command=self.preview_kokoro)
         self.kokoro_preview_btn.grid(row=0, column=1)
-        field("Kokoro voice", kokoro_row,
-              "The first Preview downloads the voice model "
-              "(about 300 MB), so it can take a minute.", key="KOKORO_VOICE",
-              get=lambda: self._kokoro_map.get(self.kokoro_menu.get(), self._saved["KOKORO_VOICE"]))
+        # Without Kokoro the row is built but never shown (other code still reads kokoro_menu safely).
+        if kokoro_ok:
+            field("Kokoro voice", kokoro_row,
+                  "The first Preview downloads the voice model "
+                  "(about 300 MB), so it can take a minute.", key="KOKORO_VOICE",
+                  get=lambda: self._kokoro_map.get(self.kokoro_menu.get(), self._saved["KOKORO_VOICE"]))
 
         self._sound_map = {J.wake_label(n): n for n in J.WAKE_SOUND_NAMES + ["random"]}
         sound_row = ctk.CTkFrame(sc, fg_color="transparent")
@@ -1021,6 +1045,13 @@ class JarvisApp(ctk.CTk):
         ctk.CTkCheckBox(sc, text="Show keys and passwords", variable=self.show_var,
                         command=self._toggle_secrets).grid(row=self._srow, column=1, sticky="w", pady=(10, 0))
         self._srow += 1
+
+        header("Uninstall")
+        self.uninstall_btn = ctk.CTkButton(sc, text="Uninstall Jarvis", width=200, fg_color="#dc2626",
+                                           hover_color="#b91c1c", command=self.uninstall_jarvis)
+        field("Remove Jarvis", self.uninstall_btn,
+              "Closes Jarvis and runs uninstall.bat, which removes its packages, shortcuts and downloaded "
+              "models. It asks before deleting your API keys.")
 
         sc = use_page("OBS")
         header("OBS Studio (optional)")
@@ -1124,7 +1155,7 @@ class JarvisApp(ctk.CTk):
             self.show_banner(*self.banner_state.error("The assistant name can't be empty."))
             return
         try:
-            backup = save_env_value(key, value)
+            save_env_value(key, value)
             if key == "JARVIS_WAKE_SOUND_STYLE":
                 J.save_wake_style(value)  # .cache/settings.json would otherwise override the .env choice
         except (OSError, ValueError) as e:
@@ -1426,7 +1457,7 @@ class JarvisApp(ctk.CTk):
                 path = create_desktop_shortcut()
                 self.post(lambda: self.show_banner(*self.banner_state.info(f"Shortcut created: {path}", "ok")))
             except Exception as e:
-                msg = f"Couldn't create the shortcut: {e}\nTry create_desktop_shortcut.bat instead."
+                msg = f"Couldn't create the shortcut: {e}\nTry tools\\create_desktop_shortcut.bat instead."
                 self.post(lambda: self.show_banner(*self.banner_state.error(msg)))
             finally:
                 self.post(lambda: self.shortcut_btn.configure(state="normal"))
@@ -1522,9 +1553,24 @@ class JarvisApp(ctk.CTk):
                    "J", fill="white", font=font)
         return img
 
+    @staticmethod
+    def _ico_tray_image(color: str) -> Any:
+        """jarvis.ico (same as the Desktop shortcut) with a small status dot, or None if it can't be loaded."""
+        if not ICON_PATH.exists():
+            return None
+        try:
+            with Image.open(ICON_PATH) as ico:
+                img = ico.convert("RGBA").resize((64, 64), Image.LANCZOS)
+            d = ImageDraw.Draw(img)
+            d.ellipse((42, 42, 63, 63), fill=color, outline="white", width=2)  # status: running/paused/...
+            return img
+        except Exception:
+            return None
+
     def _tray_image(self, key: str) -> Any:
         if key not in self._tray_images:
-            self._tray_images[key] = self._make_tray_image(STATUS_STYLE[key][1])
+            color = STATUS_STYLE[key][1]
+            self._tray_images[key] = self._ico_tray_image(color) or self._make_tray_image(color)
         return self._tray_images[key]
 
     def _start_tray(self) -> None:
@@ -1578,6 +1624,321 @@ class JarvisApp(ctk.CTk):
                 self._tray.notify(f"{J.ASSISTANT_NAME} is still running here. Right-click for options.",
                                   J.ASSISTANT_NAME)
 
+    # --- How To tab: a read-only guide. A CTkTextbox scrolls natively (no canvas), which avoids
+    # the stretched-text problem a CTkScrollableFrame has on Windows (see the Settings sub-tabs note).
+    def _howto_sections(self) -> list[tuple[str, list[Any]]]:
+        """(header, parts). A part is a plain string or a (link text, url) tuple."""
+        w = J.WAKE_PHRASE
+        return [
+            ("1. Getting started", [
+                "Do these in order:\n"
+                "  1. Install LM Studio, download a model and start its server (section 2).\n"
+                "  2. Open Settings > Brain, press Refresh and pick your model.\n"
+                "  3. Optional: add an ElevenLabs key (Account tab) and the OBS password (OBS tab).\n"
+                "  4. Press Apply next to each setting you change.\n"
+                "  5. If the orange banner says so, press Restart Jarvis.\n"
+                f"Then say \"{w}\", wait for the chime and ask your question. Headphones work best.\n"]),
+            ("2. LM Studio (Jarvis's brain)", [
+                "Jarvis thinks with a free AI model that runs on your own PC through LM Studio. Download: ",
+                ("lmstudio.ai", "https://lmstudio.ai"),
+                "\n  1. Install LM Studio and open it.\n"
+                "  2. Search for a model (see below) and download it.\n"
+                "  3. Open the Developer tab, load the model and click Start Server.\n"
+                f"     Jarvis talks to it at {J.LLM_BASE_URL} (port 1234, LM Studio's default).\n"
+                "  4. In Settings > Brain press Refresh and pick the model. The name must match the model\n"
+                "     loaded in LM Studio, otherwise Jarvis says the model isn't loaded.\n"
+                "LM Studio must be running with the server started whenever you use Jarvis.\n\n"
+                "Which model? It depends on your graphics card's memory (VRAM):\n"
+                "  - 8 GB, e.g. GTX 1070: Qwen3 4B, Q4_K_M version (recommended), or Llama 3.2 3B.\n"
+                "  - 12-16 GB, e.g. RTX 5070 Ti: Qwen3 8B or Qwen3 14B, Q4_K_M version.\n"
+                "  - Gaming at the same time: Qwen3 1.7B with GPU offload set to 0 in LM Studio (CPU only).\n"]),
+            ("3. ElevenLabs voice (optional, nicest voice)", [
+                "  1. Make a free account: ", ("elevenlabs.io/sign-up", "https://elevenlabs.io/sign-up"),
+                "\n  2. Create an API key here: ",
+                ("elevenlabs.io/app/settings/api-keys", "https://elevenlabs.io/app/settings/api-keys"),
+                "\n     Turn on these permissions: Text to Speech, Speech to Text and Voices (Read).\n"
+                "  3. Paste the key in Settings > Account and press Apply.\n"
+                "The free plan only works with ElevenLabs' default (premade) voices, not Voice Library voices.\n"
+                f"The Voice ID is already set to George ({J.GEORGE_VOICE_ID}), a default voice.\n"
+                "When the free credits run out, Jarvis switches to Kokoro or the Windows voice by itself.\n"]),
+            ("4. Kokoro (free offline voice)", [
+                "Kokoro is a free voice that runs on your PC with no internet and no account.\n"
+                "Install it with the button in Settings > Voice, or tick the Kokoro box in setup. The first time it speaks\n"
+                "it downloads its voice model (about 300 MB). Then pick Kokoro in Settings > Voice.\n"
+                "On Automatic, Jarvis uses ElevenLabs if a key is set, else Kokoro, else the Windows voice.\n"]),
+            ("5. OBS controls (optional)", [
+                "  1. In OBS Studio 28 or newer open Tools > WebSocket Server Settings.\n"
+                "  2. Tick Enable WebSocket server and leave the port at 4455.\n"
+                "  3. Click Show Connect Info and copy the Server Password.\n"
+                "  4. Paste it in Settings > OBS, press Apply, then click Find in OBS to pick your mic.\n"
+                "For \"clip that\", start the Replay Buffer in OBS first.\n"]),
+            ("6. Things you can say", [
+                f"Start with \"{w}\", wait for the chime, then say for example:\n"
+                "  - Questions: anything you like, \"what time is it?\", \"search the web for ...\"\n"
+                "  - Websites and apps: \"open YouTube\", \"open Spotify\", \"close Notepad\", \"force close <app>\"\n"
+                "    (to open your own apps and games say \"scan my apps\" first; \"forget my apps\" undoes it)\n"
+                "  - Timers: \"set a timer for 5 minutes\"\n"
+                "  - Music and volume: \"pause the music\", \"next song\", \"previous track\", \"turn it up\",\n"
+                "    \"mute\" / \"unmute\", \"set the volume to 40 percent\"\n"
+                "  - OBS: \"start recording\", \"stop recording\", \"go live\", \"stop streaming\",\n"
+                "    \"switch to scene gameplay\", \"list scenes\", \"mute my mic\", \"clip that\", \"am I live?\"\n"
+                "  - Wake sound: \"list wake sounds\", then ask to preview or change it\n"
+                "  - Gaming mode: \"gaming mode on\" / \"turn off gaming mode\"\n"
+                "  - Pause: \"stop listening\" or \"go to sleep\". Say the wake word again to wake it.\n"
+                "After an answer you can just keep talking for a few seconds. \"Thanks\" or \"that's all\" ends it.\n"
+                "Say the wake word while it's talking to cut it off.\n"]),
+            ("7. Gaming mode, Apply and Restart", [
+                "Gaming mode (switch on the Assistant tab) keeps Jarvis out of your game's way: lower priority,\n"
+                "no barge-in, and speech recognition and Kokoro move to the CPU after a restart.\n"
+                "In Settings, every row has its own Apply button. Some settings only take effect after a\n"
+                "restart - then an orange banner appears with a Restart Jarvis button.\n"]),
+            ("8. Troubleshooting", [
+                "  - It doesn't hear me: pick your mic in Settings > Voice (or set the right default mic in Windows\n"
+                "    Settings > System > Sound) and allow mic access in Windows Settings > Privacy & security > Microphone.\n"
+                "  - \"Can't reach LM Studio\": open LM Studio, load the model, click Start Server, then press\n"
+                "    Refresh in Settings > Brain.\n"
+                "  - No voice: check the voice engine in Settings > Voice and your speakers. A refused ElevenLabs\n"
+                "    key needs the three permissions above.\n"
+                "  - OBS won't connect: OBS must be open, the WebSocket server enabled, and the password must match.\n"
+                "  - Error details are written to jarvis_gui.log in the Jarvis folder.\n"
+                "Uninstall: Settings > Account > Uninstall Jarvis, or double-click uninstall.bat in the Jarvis folder.\n"]),
+        ]
+
+    def _build_howto_tab(self, tab: ctk.CTkFrame) -> None:
+        box = ctk.CTkTextbox(tab, wrap="word", font=ctk.CTkFont(size=17))
+        box.pack(fill="both", expand=True, padx=4, pady=4)
+        tb = box._textbox  # plain tk.Text: CTkTextbox.tag_config doesn't allow fonts
+        tb.configure(spacing1=3, spacing2=5, spacing3=3, padx=16, pady=10)
+        self._howto_header_font = ctk.CTkFont(size=21, weight="bold")
+        self._howto_link_font = ctk.CTkFont(size=19, weight="bold", underline=True)
+        tb.tag_configure("h", font=self._howto_header_font, spacing1=18, spacing3=8)
+        tb.tag_configure("link", foreground="#93c5fd", font=self._howto_link_font)
+        tb.tag_bind("link", "<Enter>", lambda e: tb.configure(cursor="hand2"))
+        tb.tag_bind("link", "<Leave>", lambda e: tb.configure(cursor=""))
+        for n, (title, parts) in enumerate(self._howto_sections()):
+            tb.insert("end", title + "\n", ("h",))
+            for part in parts:
+                if isinstance(part, tuple):
+                    text, url = part
+                    tag = f"link{n}_{tb.index('end')}"
+                    tb.insert("end", text, ("link", tag))
+                    tb.tag_bind(tag, "<Button-1>", lambda e, u=url: self.open_link(u))
+                else:
+                    tb.insert("end", part)
+            tb.insert("end", "\n")
+        box.configure(state="disabled")
+
+    # pip gives no overall percent, so the bar moves through phases: collecting 0-40%,
+    # downloading 40-80%, installing 80-99%, done 100%.
+    _KOKORO_LOG = J.APP_DIR / "kokoro_install.log"
+
+    def install_kokoro(self) -> None:
+        """pip install -r requirements-kokoro.txt hidden in a thread, with an in-app progress bar."""
+        req = J.APP_DIR / "requirements-kokoro.txt"
+        if not req.exists():
+            messagebox.showerror("Install Kokoro", f"Couldn't find {req.name} in:\n{J.APP_DIR}")
+            return
+        if not messagebox.askyesno(
+                "Install Kokoro voice",
+                "Kokoro is a free voice that works offline. The download is big (about 1-2 GB) and can take "
+                "a while. You can keep using Jarvis while it installs.\n\nInstall it now?"):
+            return
+        exe = Path(sys.executable)
+        if exe.name.lower() == "pythonw.exe" and (exe.parent / "python.exe").exists():
+            exe = exe.parent / "python.exe"  # same .venv, the console version (output is piped anyway)
+        self.kokoro_install_btn.configure(state="disabled", text="Installing... (this can take a while)")
+        if getattr(self, "kokoro_bar", None) is None:
+            self.kokoro_bar_row = ctk.CTkFrame(self.kokoro_install_row, fg_color="transparent")
+            self.kokoro_bar = ctk.CTkProgressBar(self.kokoro_bar_row, width=370)
+            self.kokoro_bar.grid(row=0, column=0, sticky="w")
+            self.kokoro_pct = ctk.CTkLabel(self.kokoro_bar_row, text="0%", width=44, anchor="e",
+                                           font=ctk.CTkFont(size=12))
+            self.kokoro_pct.grid(row=0, column=1, padx=(8, 0))
+            self.kokoro_status = ctk.CTkLabel(self.kokoro_install_row, text="", text_color="#9ca3af",
+                                              font=ctk.CTkFont(size=12), anchor="w")
+        self.kokoro_bar_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.kokoro_status.grid(row=3, column=0, sticky="w")
+        self.kokoro_bar.configure(mode="determinate")
+        self._kokoro_set_bar(0.0)
+        self.kokoro_status.configure(text="Starting...")
+        self._kokoro_phase_val = 0.0
+        cmd = [str(exe), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(req)]
+        threading.Thread(target=self._kokoro_install_worker, args=(cmd,), daemon=True).start()
+
+    @staticmethod
+    def _kokoro_phase(line: str, state: dict) -> tuple[float, str] | None:
+        """Turn one pip output line into (progress 0..1, short status), or None to leave things as they are."""
+        def pkg(text: str) -> str:
+            name = re.split(r"[\s<>=!~\[;(]", text.strip(), maxsplit=1)[0]
+            name = name.rsplit("/", 1)[-1].split("-")[0]  # wheel file name -> package name
+            return (name[:30] + "...") if len(name) > 30 else name
+        low = line.strip()
+        if low.startswith("Collecting "):
+            state["collect"] += 1
+            return min(0.40, 0.02 * state["collect"]), f"Finding {pkg(low[11:])}..."
+        if low.startswith("Downloading "):
+            state["download"] += 1
+            return min(0.80, 0.40 + 0.02 * state["download"]), f"Downloading {pkg(low[12:])}..."
+        if low.startswith("Installing collected packages"):
+            return 0.85, "Installing packages (this part can take a few minutes)..."
+        if low.startswith("Successfully installed"):
+            return 0.99, "Finishing up..."
+        if low.startswith("Requirement already satisfied"):
+            return None
+        return None
+
+    # pip >= 24.1 with "--progress-bar raw" prints one line per chunk while downloading, e.g.
+    #   Progress 262144 of 16718044
+    # (bytes so far / file size). Older pip rejects "raw", so we retry with "off" (phases only).
+    _PROGRESS_RE = re.compile(r"^Progress (\d+) of (\d+)\s*$")
+
+    def _kokoro_run_pip(self, cmd: list[str], log_f: Any, tail: list[str]) -> tuple[int, bool]:
+        """Run pip once, feeding the UI. Returns (exit code, raw_unsupported)."""
+        state = {"collect": 0, "download": 0}
+        current = ""          # package being downloaded (from the last "Downloading ..." line)
+        last_post = 0.0
+        last_logged = -1      # last 10% step written to the log for this file
+        raw_unsupported = False
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(cmd, cwd=str(J.APP_DIR), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1, creationflags=flags)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            m = self._PROGRESS_RE.match(line.strip())
+            if m:
+                done, total = int(m.group(1)), int(m.group(2))
+                if total <= 0:
+                    continue
+                step10 = done * 10 // total
+                if step10 != last_logged:  # keep the log short: one line per 10%
+                    last_logged = step10
+                    log_f.write(line)
+                now = time.monotonic()
+                if now - last_post >= 0.1 or done >= total:  # about 10 UI updates a second
+                    last_post = now
+                    self.post(self._kokoro_bytes, current, done, total)
+                continue
+            log_f.write(line)
+            log_f.flush()
+            if line.strip():
+                tail[:] = (tail + [line.rstrip()])[-8:]
+            if "invalid choice" in line and "raw" in line:
+                raw_unsupported = True
+            step = self._kokoro_phase(line, state)
+            if step is not None:
+                if line.strip().startswith("Downloading "):
+                    current = step[1][len("Downloading "):].rstrip(".")
+                    last_logged = -1
+                self.post(self._kokoro_progress, *step)
+        return proc.wait(), raw_unsupported
+
+    def _kokoro_install_worker(self, cmd: list[str]) -> None:
+        tail: list[str] = []
+        err = ""
+        try:
+            with open(self._KOKORO_LOG, "a", encoding="utf-8", errors="replace") as log_f:
+                for bar_mode in ("raw", "off"):
+                    full = cmd[:4] + ["--progress-bar", bar_mode] + cmd[4:]
+                    log_f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(full)}\n")
+                    code, raw_unsupported = self._kokoro_run_pip(full, log_f, tail)
+                    log_f.write(f"===== exit code {code}\n")
+                    if not (code != 0 and raw_unsupported and bar_mode == "raw"):
+                        break  # done, or a real error; only an old pip without "raw" gets a retry
+                    tail.clear()
+            if code != 0:
+                err = f"pip stopped with error code {code}."
+        except OSError as e:
+            err = str(e)
+        if not err:
+            import importlib
+            importlib.invalidate_caches()
+            if not J.kokoro_installed():
+                err = "pip finished but Kokoro still can't be found."
+        self.post(self._kokoro_install_done, err, "\n".join(tail[-5:]))
+
+    def _kokoro_set_bar(self, value: float) -> None:
+        """The only place the bar value changes, so the percentage label always matches it."""
+        self.kokoro_bar.set(value)
+        self.kokoro_pct.configure(text=f"{round(value * 100)}%")
+
+    @staticmethod
+    def _fmt_bytes(n: float) -> str:
+        if n >= 1024 ** 3:
+            return f"{n / 1024 ** 3:.1f} GB"
+        if n >= 1024 ** 2:
+            return f"{n / 1024 ** 2:.0f} MB"
+        return f"{n / 1024:.0f} KB"
+
+    def _kokoro_bytes(self, name: str, done: int, total: int) -> None:
+        """Live download of one file: bar and % show that file (reset for each file)."""
+        if getattr(self, "kokoro_bar", None) is None:
+            return
+        self.kokoro_bar.stop()
+        self.kokoro_bar.configure(mode="determinate")
+        self._kokoro_set_bar(min(1.0, done / total))
+        label = f"Downloading {name}: " if name else "Downloading: "
+        self.kokoro_status.configure(text=f"{label}{self._fmt_bytes(done)} of {self._fmt_bytes(total)}")
+
+    def _kokoro_progress(self, value: float, text: str) -> None:
+        """Phase step (collecting / downloading / installing): overall progress that never moves backwards."""
+        if getattr(self, "kokoro_bar", None) is None:
+            return
+        self._kokoro_phase_val = max(self._kokoro_phase_val, value)
+        if text.startswith("Installing"):
+            # No byte counts while installing: animate instead of a stuck number.
+            self.kokoro_bar.configure(mode="indeterminate")
+            self.kokoro_bar.start()
+            self.kokoro_pct.configure(text="")
+        else:
+            self.kokoro_bar.stop()
+            self.kokoro_bar.configure(mode="determinate")
+            self._kokoro_set_bar(self._kokoro_phase_val)
+        self.kokoro_status.configure(text=text)
+
+    def _kokoro_install_done(self, err: str, tail: str = "") -> None:
+        if err:
+            self.kokoro_install_btn.configure(state="normal", text="Install Kokoro voice")
+            self.kokoro_bar.stop()
+            self.kokoro_bar_row.grid_remove()  # bar and percentage together
+            self.kokoro_status.configure(text="Install failed.")
+            details = f"\n\nLast lines from pip:\n{tail}" if tail else ""
+            messagebox.showerror("Install Kokoro", f"Kokoro couldn't be installed: {err}{details}\n\n"
+                                 f"Full log: {self._KOKORO_LOG}\n\n"
+                                 "Check your internet connection and try again, or close Jarvis and run setup.bat "
+                                 "(tick the Kokoro box).")
+            return
+        self.kokoro_bar.stop()
+        self.kokoro_bar.configure(mode="determinate")
+        self._kokoro_set_bar(1.0)
+        self.kokoro_status.configure(text="Done!")
+        if self.kokoro_install_row is not None:
+            self.after(800, self.kokoro_install_row.grid_remove)
+        self.banner_state.pending_restart["KOKORO_INSTALL"] = "Kokoro voice"
+        self.show_banner("restart", "Kokoro installed. Restart Jarvis to use it.", True)
+
+    def uninstall_jarvis(self) -> None:
+        """Run uninstall.bat in its own console window, then quit so .venv isn't locked."""
+        bat = J.APP_DIR / "uninstall.bat"
+        if not bat.exists():
+            messagebox.showerror("Uninstall Jarvis", f"Couldn't find uninstall.bat in:\n{J.APP_DIR}")
+            return
+        if not messagebox.askyesno(
+                "Uninstall Jarvis",
+                "This will close Jarvis and remove its installed packages, shortcuts and downloaded models.\n\n"
+                "A window will open to finish the uninstall. It will ask whether to keep your settings "
+                "and API keys (.env).\n\nContinue?", icon="warning"):
+            return
+        try:
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(["cmd", "/k", str(bat)], cwd=str(J.APP_DIR), creationflags=flags, close_fds=True)
+        except OSError as e:
+            record_crash("starting uninstall.bat failed")
+            messagebox.showerror("Uninstall Jarvis", f"Couldn't start uninstall.bat: {e}\n"
+                                 "Close Jarvis and double-click uninstall.bat instead.")
+            return
+        self.quit_app()
+
     def quit_app(self) -> None:
         """Really exit: stop listening, remove the tray icon, close the window."""
         if self._closing:
@@ -1596,7 +1957,16 @@ class JarvisApp(ctk.CTk):
         self.destroy()
 
 
+def set_app_id() -> None:
+    """Give Jarvis its own taskbar identity so Windows shows jarvis.ico instead of grouping it under pythonw."""
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Jarvis.Assistant")
+
+
 def main() -> int:
+    set_app_id()  # must happen before the window is created
     try:
         app = JarvisApp()
         app.mainloop()
