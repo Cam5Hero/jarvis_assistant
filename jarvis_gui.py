@@ -1135,6 +1135,12 @@ class JarvisApp(ctk.CTk):
                                          wraplength=460, justify="left")
         self.model_status.grid(row=self._srow, column=1, sticky="w")
         self._srow += 1
+        ctk.CTkLabel(sc, text="Important: the model picked here must also be loaded in LM Studio. "
+                     "In LM Studio, load this same model (top bar, Select a model to load) "
+                     "and make sure the server is running, or Jarvis can't answer.",
+                     text_color="#fbbf24", font=ctk.CTkFont(size=12), wraplength=460,
+                     justify="left").grid(row=self._srow, column=1, sticky="w", pady=(6, 0))
+        self._srow += 1
 
         sc = use_page("Account")
         header("Names")
