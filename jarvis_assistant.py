@@ -2724,7 +2724,9 @@ def fetch_lm_models(base_url: str, timeout: float = 5.0, opener: Callable | None
     try:
         with (opener or urllib.request.urlopen)(url, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
-        return [str(m.get("id")) for m in data.get("data", []) if m.get("id")]
+        ids = [str(m.get("id")) for m in data.get("data", []) if m.get("id")]
+        # Embedding models (e.g. nomic-embed-text) can't chat, so keep them out of the picker.
+        return [i for i in ids if "embed" not in i.lower()]
     except Exception as e:
         log.warning("LM Studio check failed: %s", e)
         return None

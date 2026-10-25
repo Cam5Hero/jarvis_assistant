@@ -32,6 +32,14 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Callable
 
+# Under pythonw there is no console, so sys.stdout/stderr are None and libraries that
+# print progress (tqdm, used by openwakeword's model download) crash with
+# "'NoneType' object has no attribute 'write'". Point them at a harmless sink.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # so "import jarvis_assistant" always works
 _LOG_PATH = Path(__file__).resolve().parent / "jarvis_gui.log"
 
