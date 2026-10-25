@@ -638,6 +638,9 @@ class JarvisApp(ctk.CTk):
         self.stop_btn = ctk.CTkButton(row, text="Stop", height=40, command=self.stop,
                                       fg_color="#dc2626", hover_color="#b91c1c")
         for c, b in enumerate((self.start_btn, self.pause_btn, self.stop_btn)):
+            # Black bold text reads better on the bright colors; greyed when the button is unavailable.
+            b.configure(text_color="#000000", text_color_disabled="#000000",
+                        font=ctk.CTkFont(size=17, weight="bold"))
             b.grid(row=0, column=c, padx=5, sticky="ew")
 
         self.chat_box = ctk.CTkTextbox(tab, wrap="word", font=ctk.CTkFont(size=14), state="disabled")
@@ -909,14 +912,16 @@ class JarvisApp(ctk.CTk):
         body = ctk.CTkFrame(tab, fg_color="transparent")
         body.pack(fill="both", expand=True)
         self._settings_body = body
-        # Sub-tabs instead of a scrollbar. CustomTkinter + any canvas scroll stretches text on Windows.
+        # Sub-tabs, each a CTkScrollableFrame (see use_page).
         pages = ctk.CTkTabview(body)
         pages.pack(fill="both", expand=True)
         self._settings_pages = pages
         self._apply_rows: dict[str, dict] = {}  # key -> {"get", "btn"}  (results show in the top banner)
 
         def use_page(name: str) -> ctk.CTkFrame:
-            sc = pages.add(name)
+            # Each sub-page scrolls on its own (long pages like Voice run past the window edge).
+            sc = ctk.CTkScrollableFrame(pages.add(name), fg_color="transparent")
+            sc.pack(fill="both", expand=True)
             sc.columnconfigure(1, weight=0, minsize=460)
             sc.columnconfigure(2, weight=0)
             self._sc = sc
@@ -1742,7 +1747,7 @@ class JarvisApp(ctk.CTk):
                                   J.ASSISTANT_NAME)
 
     # --- How To tab: a read-only guide. A CTkTextbox scrolls natively (no canvas), which avoids
-    # the stretched-text problem a CTkScrollableFrame has on Windows (see the Settings sub-tabs note).
+    # needing a separate scrollable frame.
     def _howto_sections(self) -> list[tuple[str, list[Any]]]:
         """(header, parts). A part is a plain string or a (link text, url) tuple."""
         w = J.WAKE_PHRASE
