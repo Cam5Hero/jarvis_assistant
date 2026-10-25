@@ -73,6 +73,11 @@ except ImportError as _e:
 
 from tkinter import messagebox
 
+try:
+    import jarvis_updater as U  # in-app updater (standard library only)
+except Exception:  # never let a broken updater stop Jarvis from starting
+    U = None  # type: ignore[assignment]
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -352,6 +357,24 @@ def find_obs_mics(host: str, port: int, password: str, timeout: float = 4.0,
 ICON_PATH = J.APP_DIR / "jarvis.ico"
 
 
+def _clamp_secs(text: Any, lo: float, hi: float, default: float) -> float:
+    """A seconds value from .env, kept inside the slider's range (bad text -> default)."""
+    try:
+        v = float(str(text).strip())
+    except ValueError:
+        return default
+    return min(max(v, lo), hi)
+
+
+def _fmt_secs(v: float) -> str:
+    """Seconds as saved in .env: 2 decimals, no trailing zeros ("6", "0.75")."""
+    return f"{round(float(v), 2):g}"
+
+
+def _secs_text(v: float) -> str:
+    return "Off" if v <= 0 else f"{float(v):g} s"
+
+
 def find_pythonw() -> str:
     """pythonw.exe (Python with no console window) next to the Python running this app."""
     exe = Path(sys.executable)
@@ -567,6 +590,9 @@ class JarvisApp(ctk.CTk):
         self._after_id = self.after(50, self._drain)
         self._refresh_status()
         self.chat("system", "Welcome. Press Start to begin listening, or just type a request below.")
+        self._update_win: Any = None
+        self._update_busy = False
+        self.after(3000, lambda: self.check_for_updates(manual=False))  # quiet background check
 
     # -- thread-safe bridge --------------------------------------------------
 
@@ -820,6 +846,9 @@ class JarvisApp(ctk.CTk):
         "ASSISTANT_NAME": "assistant name", "ELEVENLABS_API_KEY": "ElevenLabs key",
         "ELEVENLABS_VOICE_ID": "ElevenLabs voice ID", "JARVIS_TTS_ENGINE": "voice engine",
     }
+    # Listening-time sliders: (.env key, min s, max s, default s) and the jarvis_assistant global each sets.
+    _TIMING = (("JARVIS_FOLLOWUP_SECONDS", 0.0, 30.0, 6.0), ("JARVIS_SILENCE_SECONDS", 0.5, 3.0, 0.75))
+    _TIMING_ATTR = {"JARVIS_FOLLOWUP_SECONDS": "FOLLOWUP_SECONDS", "JARVIS_SILENCE_SECONDS": "SILENCE_SECONDS"}
     _ENGINE_LABELS = {"Automatic": "", "ElevenLabs": "elevenlabs", "Kokoro (free, offline)": "kokoro",
                       "Windows voice": "windows"}
 
@@ -846,6 +875,9 @@ class JarvisApp(ctk.CTk):
             "JARVIS_WAKE_SOUND_VOLUME": get("JARVIS_WAKE_SOUND_VOLUME", f"{J.WAKE_SOUND_VOLUME:g}"),
             "JARVIS_TTS_ENGINE": get("JARVIS_TTS_ENGINE", J._env("JARVIS_TTS_ENGINE")),
             "KOKORO_VOICE": get("KOKORO_VOICE", J.KOKORO_VOICE),
+            "JARVIS_VOLUME": get("JARVIS_VOLUME", f"{J.JARVIS_VOLUME:g}"),
+            "JARVIS_FOLLOWUP_SECONDS": get("JARVIS_FOLLOWUP_SECONDS", f"{J.FOLLOWUP_SECONDS:g}"),
+            "JARVIS_SILENCE_SECONDS": get("JARVIS_SILENCE_SECONDS", f"{J.SILENCE_SECONDS:g}"),
         }
 
     def _build_settings_tab(self, tab: ctk.CTkFrame) -> None:
@@ -859,6 +891,9 @@ class JarvisApp(ctk.CTk):
             self._saved["JARVIS_WAKE_SOUND_VOLUME"] = f"{round(float(cur['JARVIS_WAKE_SOUND_VOLUME']), 2):g}"
         except ValueError:
             pass
+        self._saved["JARVIS_VOLUME"] = f"{round(J._parse_volume(cur['JARVIS_VOLUME'])):d}"
+        for k, lo, hi, d in self._TIMING:  # same format the sliders produce
+            self._saved[k] = _fmt_secs(_clamp_secs(cur[k], lo, hi, d))
         # Banner pinned above the scrolling area, so it stays visible while you scroll.
         self.banner_state = BannerState()
         self._banner_after: str | None = None
@@ -1003,6 +1038,46 @@ class JarvisApp(ctk.CTk):
               "Press Apply to keep it next time. 0% is silent.", key="JARVIS_WAKE_SOUND_VOLUME",
               get=lambda: f"{round(float(self.volume_slider.get()), 2):g}")
 
+        jvol0 = J._parse_volume(cur["JARVIS_VOLUME"])
+        jvol_row = ctk.CTkFrame(sc, fg_color="transparent")
+        jvol_row.columnconfigure(0, weight=1)
+        self.jarvis_volume_slider = ctk.CTkSlider(jvol_row, from_=0, to=100, number_of_steps=20,
+                                                  command=self._jarvis_volume_changed)
+        self.jarvis_volume_slider.set(jvol0)
+        self.jarvis_volume_slider.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.jarvis_volume_label = ctk.CTkLabel(jvol_row, text=f"{round(jvol0)}%", width=48, anchor="e")
+        self.jarvis_volume_label.grid(row=0, column=1)
+        field("Jarvis volume", jvol_row,
+              "How loud Jarvis's voice is (every voice engine, and the wake sound). Doesn't change the "
+              "Windows volume. Changes right away; press Apply to keep it next time.", key="JARVIS_VOLUME",
+              get=lambda: f"{round(float(self.jarvis_volume_slider.get())):d}")
+
+        header("Listening time")
+        self._timing_sliders: dict[str, Any] = {}
+        hints = {
+            "JARVIS_FOLLOWUP_SECONDS": ("Keep listening after a reply",
+                "After Jarvis answers, how long he keeps listening so you can ask something else without "
+                "saying the wake word. 0 = off (always say the wake word). Changes right away; press Apply to "
+                "keep it next time."),
+            "JARVIS_SILENCE_SECONDS": ("Pause before he stops listening",
+                "How long you can pause mid-sentence before Jarvis decides you're done. Raise it if he cuts "
+                "you off; lower it for quicker answers. Changes right away; press Apply to keep it next time."),
+        }
+        for k, lo, hi, d in self._TIMING:
+            v0 = _clamp_secs(cur[k], lo, hi, d)
+            row = ctk.CTkFrame(sc, fg_color="transparent")
+            row.columnconfigure(0, weight=1)
+            lbl = ctk.CTkLabel(row, text=_secs_text(v0), width=48, anchor="e")
+            step = 0.5 if hi > 5 else 0.25
+            sl = ctk.CTkSlider(row, from_=lo, to=hi, number_of_steps=int(round((hi - lo) / step)),
+                               command=lambda v, k=k, lbl=lbl: self._timing_changed(k, v, lbl))
+            sl.set(v0)
+            sl.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+            lbl.grid(row=0, column=1)
+            self._timing_sliders[k] = sl
+            title, hint = hints[k]
+            field(title, row, hint, key=k, get=lambda sl=sl: _fmt_secs(float(sl.get())))
+
         sc = use_page("Brain")
         header("Brain (LM Studio)")
         model_row = ctk.CTkFrame(sc, fg_color="transparent")
@@ -1060,6 +1135,12 @@ class JarvisApp(ctk.CTk):
         field("Remove Jarvis", self.uninstall_btn,
               "Closes Jarvis and runs uninstall.bat, which removes its packages, shortcuts and downloaded "
               "models. It asks before deleting your API keys.")
+        header("Updates")
+        self.update_btn = ctk.CTkButton(sc, text="Check for updates", width=200,
+                                        command=lambda: self.check_for_updates(manual=True))
+        field("Jarvis version", self.update_btn,
+              "Looks online for a newer version of Jarvis and installs it for you. "
+              "Your settings and API keys are kept.")
 
         sc = use_page("OBS")
         header("OBS Studio (optional)")
@@ -1242,6 +1323,12 @@ class JarvisApp(ctk.CTk):
         if key == "KOKORO_VOICE":
             J.KOKORO_VOICE = value  # read each time Kokoro speaks
             return True
+        if key == "JARVIS_VOLUME":
+            J.JARVIS_VOLUME = J._parse_volume(value)  # read at playback time
+            return True
+        if key in self._TIMING_ATTR:
+            setattr(J, self._TIMING_ATTR[key], float(value))  # read each time Jarvis listens
+            return True
         if key == "USER_TITLE":
             if value != J.USER_TITLE:
                 J.set_user_title(value)
@@ -1407,6 +1494,18 @@ class JarvisApp(ctk.CTk):
         J.WAKE_SOUND_VOLUME = v
         self.volume_label.configure(text=f"{round(v * 100)}%")
 
+    def _jarvis_volume_changed(self, value: float) -> None:
+        """Jarvis volume slider moved: the next thing Jarvis says (or the current Kokoro/ElevenLabs chunk) follows it."""
+        v = round(float(value))
+        J.JARVIS_VOLUME = J._parse_volume(v)
+        self.jarvis_volume_label.configure(text=f"{v}%")
+
+    def _timing_changed(self, key: str, value: float, label: Any) -> None:
+        """Listening-time slider moved: the next time Jarvis listens uses it."""
+        v = float(_fmt_secs(float(value)))
+        setattr(J, self._TIMING_ATTR[key], v)
+        label.configure(text=_secs_text(v))
+
     def preview_sound(self) -> None:
         if self._preview_busy:
             return
@@ -1493,6 +1592,8 @@ class JarvisApp(ctk.CTk):
             "JARVIS_WAKE_SOUND_VOLUME": f"{round(float(self.volume_slider.get()), 2):g}",
             "JARVIS_TTS_ENGINE": self._ENGINE_LABELS.get(self.engine_menu.get(), ""),
             "KOKORO_VOICE": self._kokoro_map.get(self.kokoro_menu.get(), "bm_george"),
+            "JARVIS_VOLUME": f"{round(float(self.jarvis_volume_slider.get())):d}",
+            **{k: _fmt_secs(float(sl.get())) for k, sl in self._timing_sliders.items()},
         }
         initial = getattr(self, "_voice_initial", None)
         if initial and voice_label == initial[0]:
@@ -1509,6 +1610,14 @@ class JarvisApp(ctk.CTk):
         if updates["JARVIS_WAKE_SOUND_VOLUME"] != self._cur["JARVIS_WAKE_SOUND_VOLUME"]:
             J.WAKE_SOUND_VOLUME = float(updates["JARVIS_WAKE_SOUND_VOLUME"])  # already live; keep it in sync
             applied.append("wake sound volume")
+        if updates["JARVIS_VOLUME"] != self._cur.get("JARVIS_VOLUME"):
+            J.JARVIS_VOLUME = J._parse_volume(updates["JARVIS_VOLUME"])  # already live; keep it in sync
+            applied.append("Jarvis volume")
+        for k, attr in self._TIMING_ATTR.items():
+            if updates[k] != self._cur.get(k):
+                setattr(J, attr, float(updates[k]))
+                if "listening time" not in applied:
+                    applied.append("listening time")
         if updates["USER_TITLE"] != J.USER_TITLE:
             J.set_user_title(updates["USER_TITLE"])
             if self.brain is not None:
@@ -1709,6 +1818,9 @@ class JarvisApp(ctk.CTk):
                 "    key needs the three permissions above.\n"
                 "  - OBS won't connect: OBS must be open, the WebSocket server enabled, and the password must match.\n"
                 "  - Error details are written to jarvis_gui.log in the Jarvis folder.\n"
+                "Updates: Jarvis checks for a new version when it starts. If one is ready, a window pops up -\n"
+                "click Update, then Restart Jarvis now. Your settings and keys are kept. You can also check\n"
+                "any time in Settings > Account > Check for updates.\n"
                 "Uninstall: Settings > Account > Uninstall Jarvis, or double-click uninstall.bat in the Jarvis folder.\n"]),
         ]
 
@@ -1946,6 +2058,131 @@ class JarvisApp(ctk.CTk):
                                  "Close Jarvis and double-click uninstall.bat instead.")
             return
         self.quit_app()
+
+    # -- in-app updater ------------------------------------------------------------
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        """Ask GitHub (in a background thread) whether there's a newer version. Silent unless manual."""
+        if U is None or self._update_busy or self._closing:
+            if manual and U is None:
+                messagebox.showerror("Check for updates", "The updater file (jarvis_updater.py) is missing.")
+            return
+        if manual:
+            with contextlib.suppress(Exception):
+                self.update_btn.configure(state="disabled", text="Checking...")
+
+        def work() -> None:
+            latest = U.latest_commit(timeout=8.0 if manual else 5.0)
+            self.post(self._update_check_done, latest, manual)
+
+        threading.Thread(target=work, daemon=True, name="update-check").start()
+
+    def _update_check_done(self, latest: tuple[str, str] | None, manual: bool) -> None:
+        if manual:
+            with contextlib.suppress(Exception):
+                self.update_btn.configure(state="normal", text="Check for updates")
+        if latest is None:
+            if manual:
+                messagebox.showinfo("Check for updates", "Couldn't check for updates right now.\n\n"
+                                    "Check your internet connection and try again in a few minutes.")
+            return
+        sha, msg = latest
+        if U.update_available(sha, U.installed_sha()):
+            self._show_update_window(sha, msg)
+        elif manual:
+            messagebox.showinfo("Check for updates", "You're up to date! You have the newest version of Jarvis.")
+
+    def _show_update_window(self, sha: str, msg: str) -> None:
+        if self._update_win is not None and self._update_win.winfo_exists():
+            self._update_win.lift()
+            return
+        win = ctk.CTkToplevel(self)
+        self._update_win = win
+        win.title("Update Jarvis")
+        win.geometry("480x300")
+        win.resizable(False, False)
+        win.transient(self)
+        win.after(200, win.lift)
+        ctk.CTkLabel(win, text="A new version of Jarvis is ready", font=ctk.CTkFont(size=20, weight="bold")
+                     ).pack(pady=(18, 6), padx=16)
+        ctk.CTkLabel(win, text="What's new: " + (msg or "improvements and fixes"), wraplength=440,
+                     justify="left").pack(padx=16)
+        ctk.CTkLabel(win, text="Your settings and API keys stay as they are.", text_color="#9ca3af"
+                     ).pack(pady=(6, 0))
+        self._upd_bar = ctk.CTkProgressBar(win, width=420)
+        self._upd_bar.set(0)
+        self._upd_status = ctk.CTkLabel(win, text="", wraplength=440)
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(side="bottom", pady=16)
+        self._upd_btns = btns
+        self._upd_go = ctk.CTkButton(btns, text="Update", width=140, command=lambda: self._start_update(sha))
+        self._upd_go.grid(row=0, column=0, padx=8)
+        self._upd_later = ctk.CTkButton(btns, text="Later", width=140, fg_color="#4b5563",
+                                        hover_color="#374151", command=win.destroy)
+        self._upd_later.grid(row=0, column=1, padx=8)
+
+    def _start_update(self, sha: str) -> None:
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._upd_go.configure(state="disabled")
+        self._upd_later.configure(state="disabled")
+        self._update_win.protocol("WM_DELETE_WINDOW", lambda: None)  # don't close mid-update
+        self._upd_bar.pack(pady=(14, 4))
+        self._upd_status.pack()
+        self._upd_status.configure(text="Starting...")
+
+        def progress(frac: float, text: str) -> None:
+            self.post(self._update_progress, frac, text)
+
+        def work() -> None:
+            try:
+                res = U.run_update(sha, progress=progress)
+                self.post(self._update_finished, None, res)
+            except Exception as e:
+                U.log(f"update FAILED: {e!r}\n{traceback.format_exc()}")
+                self.post(self._update_finished, e, None)
+
+        threading.Thread(target=work, daemon=True, name="updater").start()
+
+    def _update_progress(self, frac: float, text: str) -> None:
+        with contextlib.suppress(Exception):
+            if frac < 0:
+                if self._upd_bar.cget("mode") != "indeterminate":
+                    self._upd_bar.configure(mode="indeterminate")
+                    self._upd_bar.start()
+            else:
+                if self._upd_bar.cget("mode") != "determinate":
+                    self._upd_bar.stop()
+                    self._upd_bar.configure(mode="determinate")
+                self._upd_bar.set(frac)
+            self._upd_status.configure(text=text)
+
+    def _update_finished(self, err: Exception | None, res: dict | None) -> None:
+        self._update_busy = False
+        win = self._update_win
+        if win is None or not win.winfo_exists():
+            return
+        with contextlib.suppress(Exception):
+            self._upd_bar.stop()
+            self._upd_bar.configure(mode="determinate")
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        for w in self._upd_btns.winfo_children():
+            w.destroy()
+        if err is not None:
+            self._upd_bar.set(0)
+            self._upd_status.configure(text="The update didn't finish. Check your internet and try again.\n"
+                                       f"Details are in {U.LOG_NAME} in the Jarvis folder.", text_color="#f87171")
+            ctk.CTkButton(self._upd_btns, text="Close", width=140, command=win.destroy).grid(row=0, column=0)
+            return
+        self._upd_bar.set(1.0)
+        note = "" if res and res.get("pip_ok", True) else (
+            "\nSome add-ons couldn't be updated - if Jarvis has trouble, run setup.bat again.")
+        self._upd_status.configure(text="Update installed! Restart Jarvis to use the new version." + note)
+        ctk.CTkButton(self._upd_btns, text="Restart Jarvis now", width=160,
+                      command=self.restart_app).grid(row=0, column=0, padx=8)
+        ctk.CTkButton(self._upd_btns, text="Later", width=120, fg_color="#4b5563", hover_color="#374151",
+                      command=win.destroy).grid(row=0, column=1, padx=8)
 
     def quit_app(self) -> None:
         """Really exit: stop listening, remove the tray icon, close the window."""

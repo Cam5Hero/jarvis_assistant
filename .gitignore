@@ -8,3 +8,6 @@ venv/
 jarvis_gui.log
 kokoro_install.log
 setup.log
+.jarvis_version
+update.log
+*.updtmp

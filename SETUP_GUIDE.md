@@ -80,6 +80,9 @@ Say **"Hey Jarvis"**, wait for the chime, then ask your question. Headphones wor
 - **Moved the folder?** Run `setup.bat` again (it recreates the Desktop shortcut).
 - **Updating:** if you downloaded the ZIP, download the new ZIP, extract it, copy your old `.env` file into the new folder, and run `setup.bat`.
 
+## Updating Jarvis
+You don't need to download the ZIP again. When Jarvis starts it quietly checks for a new version. If one is ready, a window says **"A new version of Jarvis is ready"** — click **Update**, wait for it to finish, then click **Restart Jarvis now**. Your settings, API keys (`.env`) and downloaded voices/models are kept. You can also check any time in **Settings > Account > Check for updates**. If something goes wrong, details are in `update.log` in the Jarvis folder.
+
 ## Uninstall
 1. Close Jarvis (right-click the tray icon > Quit), then double-click **`uninstall.bat`** in the Jarvis folder.
 2. Read the list, type **Y** and press Enter. It removes:

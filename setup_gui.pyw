@@ -30,6 +30,16 @@ def venv_python(windowless: bool = False) -> Path:
     return VENV / "bin" / "python"
 
 
+def has_nvidia_gpu() -> bool:
+    """True if an NVIDIA driver is installed (nvidia-smi is on PATH or in System32). Windows only."""
+    if os.name != "nt":
+        return False
+    import shutil
+    if shutil.which("nvidia-smi"):
+        return True
+    return (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe").exists()
+
+
 def console_python() -> str:
     """The python.exe next to this pythonw.exe (same install), for running hidden child processes."""
     exe = Path(sys.executable)
@@ -137,6 +147,7 @@ class Installer:
             with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as self.log:
                 self._write(f"\n##### Jarvis setup {time.strftime('%Y-%m-%d %H:%M:%S')}, Python {sys.version}\n")
                 self._steps()
+                self._record_version()
             self.report("done")
         except SetupError as e:
             self.report("error", str(e), "\n".join(self.tail[-6:]))
@@ -154,14 +165,38 @@ class Installer:
                 raise SetupError("Setup couldn't get started in this folder. Try moving the Jarvis folder to Documents.")
         self.report("progress", 0.05, "Getting things ready...")
         self._pip(str(py), ["--upgrade", "pip"], 0.05, 0.10, "Getting things ready...")
+        gpu = has_nvidia_gpu() and (APP_DIR / "requirements-gpu.txt").exists()
+        self._write(f"(NVIDIA graphics card found: {gpu})\n")
         top = 0.65 if self.with_kokoro else 0.95
+        if gpu:
+            top = 0.45 if self.with_kokoro else 0.6
         self._pip(str(py), ["-r", str(APP_DIR / "requirements.txt")], 0.10, top, "Downloading Jarvis...")
+        if gpu:
+            hi = 0.65 if self.with_kokoro else 0.95
+            try:  # optional: without it speech recognition just runs on the CPU
+                self._pip(str(py), ["-r", str(APP_DIR / "requirements-gpu.txt")], top, hi,
+                          "Adding the graphics card speed-up (big download)...")
+            except SetupError:
+                self._write("(GPU speed-up not installed; Jarvis will use the CPU)\n")
         if self.with_kokoro:
             self._pip(str(py), ["-r", str(APP_DIR / "requirements-kokoro.txt")], 0.65, 0.95,
                       "Downloading the offline voice...", "The offline voice (Kokoro) couldn't be added. "
                       "Run setup again without it, or add it later in Jarvis: Settings > Voice.")
         self._shortcut()
         self.report("progress", 1.0, "Done!")
+
+    def _record_version(self) -> None:
+        """Remember which GitHub version is installed (.jarvis_version) so Jarvis can spot updates.
+        Silent on any failure: Jarvis will then simply offer the latest version once."""
+        try:
+            sys.path.insert(0, str(APP_DIR))
+            import jarvis_updater as U
+
+            latest = U.latest_commit(timeout=6.0)
+            if latest and U.write_installed_sha(latest[0], APP_DIR):
+                self._write(f"(installed version {latest[0][:7]})\n")
+        except Exception:
+            pass
 
     def _shortcut(self) -> None:
         """Same plain PowerShell as tools\\create_desktop_shortcut.bat (WScript.Shell makes Desktop\\Jarvis.lnk)."""

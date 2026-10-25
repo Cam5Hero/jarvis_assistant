@@ -21,6 +21,7 @@ import datetime as _dt
 import difflib
 import json
 import logging
+import contextlib
 import os
 import re
 import subprocess
@@ -173,6 +174,35 @@ KOKORO_DEVICE = _env("KOKORO_DEVICE", "auto").lower()  # auto | cpu | cuda
 TTS_ENGINES = ("elevenlabs", "kokoro", "windows")
 
 
+def _parse_volume(value: str | float | None, default: float = 100.0) -> float:
+    """JARVIS_VOLUME as a percent 0-100 (bad values -> default)."""
+    try:
+        v = float(str(value).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(100.0, v))
+
+
+# Loudness of Jarvis's own voice (all TTS engines + wake chimes), 0-100 %. Not the Windows volume.
+# Read at playback time, so changing it (GUI slider) applies live.
+JARVIS_VOLUME = _parse_volume(_env("JARVIS_VOLUME", "100"))
+
+
+def volume_gain() -> float:
+    return _parse_volume(JARVIS_VOLUME) / 100.0
+
+
+def scale_pcm16(data: bytes, gain: float | None = None) -> bytes:
+    """Scale little-endian int16 PCM bytes by the Jarvis volume, clipped to avoid wrap-around distortion."""
+    g = volume_gain() if gain is None else gain
+    if g >= 0.999 or not data:
+        return data
+    import numpy as np
+
+    a = np.frombuffer(data[: len(data) - (len(data) % 2)], dtype="<i2").astype(np.float32) * g
+    return np.clip(a, -32768, 32767).astype("<i2").tobytes()
+
+
 def kokoro_installed() -> bool:
     """True if the optional kokoro package is installed (doesn't import torch yet)."""
     try:
@@ -238,7 +268,26 @@ def load_kokoro(device: str = "") -> Any:
             log.info("TTS: Kokoro loaded on %s", dev)
             return pipe
         except Exception as e:
-            log.warning("Kokoro unavailable (%s)", e)
+            log.debug("Kokoro load failed on %s", dev, exc_info=True)
+            if dev != "cpu":
+                # Anything that blew up outside the inner GPU try (or a second GPU-side error) gets one
+                # clean CPU attempt. Old GPUs (e.g. Pascal / GTX 10xx) with new torch builds can fail oddly.
+                try:
+                    from kokoro import KPipeline
+
+                    log.warning("Kokoro on %s failed (%s); retrying on CPU.", dev, e)
+                    pipe = KPipeline(lang_code="b", repo_id="hexgrad/Kokoro-82M", device="cpu")
+                    _kokoro_pipe[0], _kokoro_pipe[1] = pipe, "cpu"
+                    log.info("TTS: Kokoro loaded on cpu")
+                    return pipe
+                except Exception as e2:
+                    log.debug("Kokoro CPU retry failed", exc_info=True)
+                    e = e2
+            hint = ""
+            if isinstance(e, OverflowError):
+                hint = (" - this usually means a corrupt/partial model download; delete the "
+                        "hexgrad/Kokoro-82M folder in the Hugging Face cache and try again")
+            log.warning("Kokoro unavailable (%s: %s)%s", type(e).__name__, e, hint)
             return None
 
 
@@ -374,7 +423,7 @@ class Speaker:
                 if not data:
                     return
                 got_any = True
-                stream.write(data)
+                stream.write(scale_pcm16(data))
 
             for chunk in self._eleven.text_to_speech.convert(
                 voice_id=ELEVENLABS_VOICE_ID,
@@ -433,7 +482,7 @@ class Speaker:
                     stream.start()
                     self._pcm_stream = stream
                 got_any = True
-                stream.write(audio.tobytes())
+                stream.write(scale_pcm16(audio.tobytes()))
             return got_any or self.interrupted.is_set()
         except Exception as e:
             if got_any or self.interrupted.is_set():
@@ -467,10 +516,11 @@ class Speaker:
                 engine.setProperty("rate", int(rate))  # words per minute, default about 200
             vol = _env("JARVIS_VOICE_VOLUME")
             try:
-                if vol:
-                    engine.setProperty("volume", max(0.0, min(1.0, float(vol))))
+                base = max(0.0, min(1.0, float(vol))) if vol else 1.0
             except ValueError:
-                pass
+                base = 1.0
+            # pyttsx3/SAPI volume is per-engine (0.0-1.0), not system volume; fold in JARVIS_VOLUME.
+            engine.setProperty("volume", max(0.0, min(1.0, base * volume_gain())))
             if self.interrupted.is_set():
                 return
             engine.say(text)
@@ -1957,6 +2007,54 @@ def _run_whisper(model, audio) -> str:
     return " ".join(s.text for s in segs).strip()
 
 
+_NVIDIA_DLLS_ADDED = False
+
+
+def nvidia_dll_dirs() -> list[str]:
+    """bin folders of the pip NVIDIA wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12): site-packages/nvidia/*/bin."""
+    roots: list[Path] = []
+    try:
+        import nvidia  # namespace package created by the nvidia-* wheels
+
+        roots += [Path(p) for p in getattr(nvidia, "__path__", [])]
+    except Exception:
+        pass
+    try:
+        import site
+        import sysconfig
+
+        for sp in [sysconfig.get_paths().get("purelib", ""), *getattr(site, "getsitepackages", lambda: [])()]:
+            if sp:
+                roots.append(Path(sp) / "nvidia")
+    except Exception:
+        pass
+    out: list[str] = []
+    for root in roots:
+        try:
+            for b in sorted(root.glob("*/bin")):
+                if b.is_dir() and str(b) not in out:
+                    out.append(str(b))
+        except OSError:
+            pass
+    return out
+
+
+def add_nvidia_dll_dirs() -> list[str]:
+    """Windows: let CTranslate2 find cublas64_12.dll / cudnn*.dll from the pip wheels. Safe to call often."""
+    global _NVIDIA_DLLS_ADDED
+    if os.name != "nt" or _NVIDIA_DLLS_ADDED:
+        return []
+    _NVIDIA_DLLS_ADDED = True
+    dirs = nvidia_dll_dirs()
+    for d in dirs:
+        with contextlib.suppress(Exception):
+            os.add_dll_directory(d)
+    if dirs:  # CTranslate2 loads cuBLAS lazily with LoadLibrary, which also searches PATH
+        os.environ["PATH"] = os.pathsep.join(dirs + [os.environ.get("PATH", "")])
+        log.info("CUDA DLL folders added: %s", ", ".join(dirs))
+    return dirs
+
+
 def load_whisper(device: str, model_cls: Any = None):
     """Load faster-whisper, warming up CUDA so missing DLLs fail here, not mid-chat."""
     if model_cls is None:
@@ -1964,9 +2062,18 @@ def load_whisper(device: str, model_cls: Any = None):
     import numpy as np
 
     device = (device or "auto").lower()
-    tries = ["cuda", "cpu"] if device == "auto" else [device, "cpu"]
-    for dev in dict.fromkeys(tries):
-        ct = "float16" if dev == "cuda" else "int8"
+    if device in ("auto", "cuda"):
+        add_nvidia_dll_dirs()  # must happen before CTranslate2 first touches CUDA
+    devs = ["cuda", "cpu"] if device == "auto" else [device, "cpu"]
+    tries = []
+    for dev in dict.fromkeys(devs):
+        if dev == "cuda":
+            # float16 needs compute capability >= 7.0; Pascal cards (GTX 10xx) refuse it, so try
+            # int8_float32 / float32 on the GPU before giving up on CUDA.
+            tries += [(dev, "float16"), (dev, "int8_float32"), (dev, "float32")]
+        else:
+            tries.append((dev, "int8"))
+    for dev, ct in tries:
         try:
             m = model_cls(WHISPER_MODEL, device=dev, compute_type=ct)
             if dev != "cpu":
@@ -1974,7 +2081,7 @@ def load_whisper(device: str, model_cls: Any = None):
             log.info("Whisper '%s' on %s (%s)", WHISPER_MODEL, dev, ct)
             return m
         except Exception as e:
-            log.warning("Whisper on %s failed: %s", dev, e)
+            log.warning("Whisper on %s (%s) failed: %s", dev, ct, e)
     raise RuntimeError("Could not load faster-whisper on any device.")
 
 
@@ -2157,7 +2264,7 @@ def resume_from_pause(speaker: Any, state: PauseState) -> None:
     state.set(False)  # prints [listening]
 
 
-def conversation(ears: Any, brain: Any, speaker: Any, *, followup_seconds: float = FOLLOWUP_SECONDS,
+def conversation(ears: Any, brain: Any, speaker: Any, *, followup_seconds: float | None = None,
                  cue: Callable[[], None] = soft_cue, state: PauseState | None = None,
                  poll: Callable[[], None] = lambda: None, listen_cue: Callable[[], None] = lambda: None,
                  wake_cue: Callable[[], None] = lambda: None, barge_in: bool | None = None) -> None:
@@ -2165,6 +2272,8 @@ def conversation(ears: Any, brain: Any, speaker: Any, *, followup_seconds: float
     If the user barges in (wake word while a reply is spoken), speech stops and it listens for
     a fresh request right away."""
     state = state or PauseState()
+    if followup_seconds is None:
+        followup_seconds = FOLLOWUP_SECONDS  # read now, so the GUI slider applies to the next session
     first = True
     while True:
         if first:
@@ -2659,6 +2768,9 @@ def chime(volume: float | None = None, enabled: bool | None = None, sd: Any = No
         tone = (custom * max(0.0, min(1.0, v / max(WAKE_SOUND_VOLUME, 1e-6)))).astype(custom.dtype) \
             if custom is not None else make_chime(v)
         tone = with_preroll(tone)
+        g = volume_gain()
+        if g < 0.999:
+            tone = (tone * g).astype(tone.dtype)
         sd.play(tone, CHIME_RATE)
         done = threading.Event()
         threading.Thread(target=lambda: (sd.wait(), done.set()), daemon=True).start()
