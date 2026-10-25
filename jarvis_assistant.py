@@ -2070,7 +2070,14 @@ def load_whisper(device: str, model_cls: Any = None):
         if dev == "cuda":
             # float16 needs compute capability >= 7.0; Pascal cards (GTX 10xx) refuse it, so try
             # int8_float32 / float32 on the GPU before giving up on CUDA.
-            tries += [(dev, "float16"), (dev, "int8_float32"), (dev, "float32")]
+            cts = ["float16", "int8_float32", "float32"]
+            try:  # ask the card what it supports so older GPUs skip float16 quietly
+                import ctranslate2
+                ok = set(ctranslate2.get_supported_compute_types("cuda"))
+                cts = [c for c in cts if c in ok] or cts
+            except Exception:
+                pass
+            tries += [(dev, c) for c in cts]
         else:
             tries.append((dev, "int8"))
     for dev, ct in tries:
