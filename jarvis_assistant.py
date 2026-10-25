@@ -140,7 +140,7 @@ BARGE_IN = _env_bool("JARVIS_BARGE_IN", True)
 BARGE_IN_THRESHOLD = _env_float("JARVIS_BARGE_IN_THRESHOLD", 0.7)
 SILENCE_SECONDS = _env_float("JARVIS_SILENCE_SECONDS", 0.75)
 MAX_RECORD_SECONDS = _env_float("JARVIS_MAX_RECORD_SECONDS", 10.0)
-VAD_RMS_THRESHOLD = _env_float("JARVIS_VAD_RMS", 500.0)  # int16 RMS; raise in noisy rooms
+VAD_RMS_THRESHOLD = _env_float("JARVIS_VAD_RMS", 500.0)  # int16 RMS; raise in noisy rooms (GUI: Mic sensitivity, read live)
 INPUT_DEVICE = _env("JARVIS_INPUT_DEVICE") or None
 FOLLOWUP_SECONDS = _env_float("JARVIS_FOLLOWUP_SECONDS", 6.0)  # 0 disables follow-up mode
 FOLLOWUP_END_PHRASES = [
@@ -2183,7 +2183,7 @@ class Ears:
         """
         np = self.np
         frames, silent, heard = [], 0.0, False
-        speech_start = 0.0
+        speech_start, peak = 0.0, 0.0
         frame_s = FRAME_SAMPLES / SAMPLE_RATE
         with self._stream() as s:
             while True:
@@ -2193,7 +2193,8 @@ class Ears:
                 poll()
                 frames.append(f[:, 0].copy())
                 rms = float(np.sqrt(np.mean(f.astype(np.float32) ** 2)))
-                if rms >= VAD_RMS_THRESHOLD:
+                peak = max(peak, rms)
+                if rms >= VAD_RMS_THRESHOLD:  # module global, so the GUI slider applies right away
                     if not heard:
                         speech_start = time.time()
                     heard, silent = True, 0.0
@@ -2202,6 +2203,8 @@ class Ears:
                 # Stop after trailing silence; give up early if nothing said in ~3 s.
                 if (heard and silent >= SILENCE_SECONDS) or (not heard and silent >= start_timeout):
                     break
+        log.info("Recording: peak mic RMS %.0f (speech threshold %.0f)%s", peak, VAD_RMS_THRESHOLD,
+                 "" if heard else " - no speech detected; raise Mic sensitivity if your mic is quiet")
         if not heard:
             return None
         return np.concatenate(frames).astype(np.float32) / 32768.0

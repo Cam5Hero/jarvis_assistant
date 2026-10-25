@@ -852,6 +852,23 @@ class JarvisApp(ctk.CTk):
     # Listening-time sliders: (.env key, min s, max s, default s) and the jarvis_assistant global each sets.
     _TIMING = (("JARVIS_FOLLOWUP_SECONDS", 0.0, 30.0, 6.0), ("JARVIS_SILENCE_SECONDS", 0.5, 3.0, 0.75))
     _TIMING_ATTR = {"JARVIS_FOLLOWUP_SECONDS": "FOLLOWUP_SECONDS", "JARVIS_SILENCE_SECONDS": "SILENCE_SECONDS"}
+    # Mic sensitivity slider: 1-10 mapped onto JARVIS_VAD_RMS (higher = more sensitive = lower threshold).
+    # 5 = 500 (the old default); each step is 75 RMS, so 1 = 800 and 10 = 125.
+    _MIC_SENS_MIN, _MIC_SENS_MAX, _MIC_SENS_DEFAULT_RMS, _MIC_SENS_STEP = 1, 10, 500.0, 75.0
+
+    @classmethod
+    def _sens_to_rms(cls, level: float) -> int:
+        return int(round(cls._MIC_SENS_DEFAULT_RMS + (5 - round(level)) * cls._MIC_SENS_STEP))
+
+    @classmethod
+    def _rms_to_sens(cls, rms: Any) -> int:
+        try:
+            v = float(rms)
+        except (TypeError, ValueError):
+            v = cls._MIC_SENS_DEFAULT_RMS
+        lvl = round(5 + (cls._MIC_SENS_DEFAULT_RMS - v) / cls._MIC_SENS_STEP)
+        return int(min(cls._MIC_SENS_MAX, max(cls._MIC_SENS_MIN, lvl)))
+
     _ENGINE_LABELS = {"Automatic": "", "ElevenLabs": "elevenlabs", "Kokoro (free, offline)": "kokoro",
                       "Windows voice": "windows"}
 
@@ -881,6 +898,7 @@ class JarvisApp(ctk.CTk):
             "JARVIS_VOLUME": get("JARVIS_VOLUME", f"{J.JARVIS_VOLUME:g}"),
             "JARVIS_FOLLOWUP_SECONDS": get("JARVIS_FOLLOWUP_SECONDS", f"{J.FOLLOWUP_SECONDS:g}"),
             "JARVIS_SILENCE_SECONDS": get("JARVIS_SILENCE_SECONDS", f"{J.SILENCE_SECONDS:g}"),
+            "JARVIS_VAD_RMS": get("JARVIS_VAD_RMS", f"{J.VAD_RMS_THRESHOLD:g}"),
         }
 
     def _build_settings_tab(self, tab: ctk.CTkFrame) -> None:
@@ -897,6 +915,10 @@ class JarvisApp(ctk.CTk):
         self._saved["JARVIS_VOLUME"] = f"{round(J._parse_volume(cur['JARVIS_VOLUME'])):d}"
         for k, lo, hi, d in self._TIMING:  # same format the sliders produce
             self._saved[k] = _fmt_secs(_clamp_secs(cur[k], lo, hi, d))
+        try:  # keep a custom .env value (e.g. 600) as-is until the slider is actually moved
+            self._saved["JARVIS_VAD_RMS"] = f"{float(cur['JARVIS_VAD_RMS']):g}"
+        except ValueError:
+            self._saved["JARVIS_VAD_RMS"] = f"{self._MIC_SENS_DEFAULT_RMS:g}"
         # Banner pinned above the scrolling area, so it stays visible while you scroll.
         self.banner_state = BannerState()
         self._banner_after: str | None = None
@@ -1082,6 +1104,22 @@ class JarvisApp(ctk.CTk):
             self._timing_sliders[k] = sl
             title, hint = hints[k]
             field(title, row, hint, key=k, get=lambda sl=sl: _fmt_secs(float(sl.get())))
+
+        sens_row = ctk.CTkFrame(sc, fg_color="transparent")
+        sens_row.columnconfigure(0, weight=1)
+        sens0 = self._rms_to_sens(self._saved["JARVIS_VAD_RMS"])
+        self._mic_sens_touched = False
+        self.mic_sens_label = ctk.CTkLabel(sens_row, text=str(sens0), width=48, anchor="e")
+        self.mic_sens_slider = ctk.CTkSlider(
+            sens_row, from_=self._MIC_SENS_MIN, to=self._MIC_SENS_MAX,
+            number_of_steps=self._MIC_SENS_MAX - self._MIC_SENS_MIN, command=self._mic_sens_changed)
+        self.mic_sens_slider.set(sens0)
+        self.mic_sens_slider.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.mic_sens_label.grid(row=0, column=1)
+        field("Mic sensitivity", sens_row,
+              "Raise this if Jarvis stops listening before you finish talking or doesn't hear you; lower it "
+              "if background noise keeps him listening. 5 is the default. Changes right away; press Apply "
+              "to keep it next time.", key="JARVIS_VAD_RMS", get=self._mic_sens_value)
 
         sc = use_page("Brain")
         header("Brain (LM Studio)")
@@ -1334,6 +1372,9 @@ class JarvisApp(ctk.CTk):
         if key in self._TIMING_ATTR:
             setattr(J, self._TIMING_ATTR[key], float(value))  # read each time Jarvis listens
             return True
+        if key == "JARVIS_VAD_RMS":
+            J.VAD_RMS_THRESHOLD = float(value)  # read on every mic frame
+            return True
         if key == "USER_TITLE":
             if value != J.USER_TITLE:
                 J.set_user_title(value)
@@ -1511,6 +1552,19 @@ class JarvisApp(ctk.CTk):
         setattr(J, self._TIMING_ATTR[key], v)
         label.configure(text=_secs_text(v))
 
+    def _mic_sens_value(self) -> str:
+        """JARVIS_VAD_RMS for the slider; an untouched slider keeps whatever .env already had."""
+        if not self._mic_sens_touched:
+            return self._saved["JARVIS_VAD_RMS"]
+        return str(self._sens_to_rms(float(self.mic_sens_slider.get())))
+
+    def _mic_sens_changed(self, value: float) -> None:
+        """Mic sensitivity slider moved: the very next mic frame uses the new speech threshold."""
+        self._mic_sens_touched = True
+        lvl = int(round(float(value)))
+        J.VAD_RMS_THRESHOLD = float(self._sens_to_rms(lvl))
+        self.mic_sens_label.configure(text=str(lvl))
+
     def preview_sound(self) -> None:
         if self._preview_busy:
             return
@@ -1599,6 +1653,7 @@ class JarvisApp(ctk.CTk):
             "KOKORO_VOICE": self._kokoro_map.get(self.kokoro_menu.get(), "bm_george"),
             "JARVIS_VOLUME": f"{round(float(self.jarvis_volume_slider.get())):d}",
             **{k: _fmt_secs(float(sl.get())) for k, sl in self._timing_sliders.items()},
+            "JARVIS_VAD_RMS": self._mic_sens_value(),
         }
         initial = getattr(self, "_voice_initial", None)
         if initial and voice_label == initial[0]:
@@ -1623,6 +1678,9 @@ class JarvisApp(ctk.CTk):
                 setattr(J, attr, float(updates[k]))
                 if "listening time" not in applied:
                     applied.append("listening time")
+        if updates["JARVIS_VAD_RMS"] != self._cur.get("JARVIS_VAD_RMS"):
+            J.VAD_RMS_THRESHOLD = float(updates["JARVIS_VAD_RMS"])  # already live; keep it in sync
+            applied.append("mic sensitivity")
         if updates["USER_TITLE"] != J.USER_TITLE:
             J.set_user_title(updates["USER_TITLE"])
             if self.brain is not None:

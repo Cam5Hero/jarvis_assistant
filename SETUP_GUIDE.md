@@ -72,6 +72,8 @@ Say **"Hey Jarvis"**, wait for the chime, then ask your question. Headphones wor
 - **Jarvis says it can't reach LM Studio:** open LM Studio, load the model, click **Start Server** in the Developer tab, then press **Refresh** in Settings > Brain.
 - **Jarvis doesn't hear "Hey Jarvis":** check the microphone in Settings > Voice and that Windows allows mic access
   (Windows Settings > Privacy & security > Microphone).
+- **Jarvis stops listening before you finish talking (or doesn't hear you):** raise **Mic sensitivity** in
+  Settings > Voice > Listening time (1-10, default 5). Lower it if background noise keeps him listening.
 - **ElevenLabs key refused:** recreate the key with the three permissions above, or pick a default voice.
 - **Games feel slower while Jarvis runs:** see "Gaming mode" in the README (e.g. use a smaller Whisper model).
 - **OBS commands don't work:** make sure OBS is open, the WebSocket server is enabled, and the password matches.
